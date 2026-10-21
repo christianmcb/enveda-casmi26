@@ -1,0 +1,12 @@
+# Core stack used by src/, work/ and the notebooks. Only rdkit is pinned: the metric uses RDKit 2026.03.3
+# for tautomer canonicalisation, so keys computed with another version may differ.
+rdkit==2026.3.3
+numpy
+pandas
+scipy
+scikit-learn
+pyarrow
+matplotlib
+tqdm
+torch      # deep MLP (src/mlp.py); developed with 2.14.1 on Apple MPS
+nbformat   # only for work/build_kaggle_notebook.py

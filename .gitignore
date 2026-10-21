@@ -1,0 +1,11 @@
+# competition data and heavy artifacts are never committed
+data/
+artifacts/
+kaggle_work*/
+*.npy
+*.npz
+*.pt
+*.parquet
+__pycache__/
+.DS_Store
+.ipynb_checkpoints/
