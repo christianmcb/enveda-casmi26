@@ -1,10 +1,14 @@
 # Enveda CASMI 2026 — Molecule ID from MS/MS spectra
 
-**Baseline, release v0.1** · Kaggle competition *Enveda CASMI 2026 – Molecule ID From Mass Spectra* · metric **MRR@25**
+**Release v0.2** · Kaggle competition *Enveda CASMI 2026 – Molecule ID From Mass Spectra* · metric **MRR@25**
 
-Given an LC-MS/MS spectrum of a natural product, predict its 2D structure (SMILES), including molecules that never appear in the training data. This repository is the first snapshot of a leakage-aware baseline: a spectrum → molecular-fingerprint model, a mass-window candidate filter, a validation setup that can be trusted, and the experiments that took the local benchmark from 0.17 to 0.67 MRR@25.
+Given an LC-MS/MS spectrum of a natural product, predict its 2D structure (SMILES), including molecules that never appear in the training data. v0.2 is an end-to-end, leakage-aware solution: spectrum → fingerprint deep MLP → mass-window candidate filter → ranking over a train + COCONUT library with a PubChem popularity prior. **Best hidden-test score so far: MRR@25 = 0.146.**
 
-> **Read this first (honest status).** The first Kaggle submission (deep MLP, candidate library = training molecules only) scored **0.076** on the leaderboard. A train-only library cannot contain novel molecules, so most hidden-test molecules are unreachable regardless of model quality. The local benchmark numbers below measure *ranking quality when the true molecule is in the candidate pool*; they are **not** leaderboard predictions. Extending the candidate pool (COCONUT, PubChem) is the next step and is not part of this release's results. See [Limitations](#limitations).
+> **Read this first (honest status).** Leaderboard history: **0.076** (train-only library) → **0.128** (+ COCONUT) → **0.146** (+ popularity prior); a PubChem mass-window channel was neutral (0.142 vs 0.140 at the same weight). A single score has a standard error of about 0.014, so differences below ~0.01 are noise. Public pipelines reach ~0.45 and score ~0.35 on an essentially identical candidate pool, so **the ranker, not the pool, is now the gap**. The local benchmark numbers below measure ranking quality when the true molecule is in the candidate pool; they are optimistic for novel molecules (see [Limitations](#limitations)).
+>
+> **The walkthrough with every figure and table is the report notebook [`notebooks/casmi_v0_2.ipynb`](notebooks/casmi_v0_2.ipynb)** (already executed; needs no competition data).
+
+![Leaderboard history](reports/v02_1_leaderboard_history.png)
 
 ---
 
@@ -37,9 +41,9 @@ precursor m/z + adduct ──► neutral mass ──► mass window ──► ca
 1. **Cleaning.** Keep known adducts, precursor 50–1500 m/z, recorded |error| ≤ 20 ppm; collapse array-valued collision energies; drop dimers.
 2. **Neutral mass** = (precursor m/z − adduct shift) / n. The mass window is a free, strong filter on candidates.
 3. **Features** (v0.1: 1 Da bins; final: fragment block + neutral-loss block, each in nominal-mass × mass-defect sub-bins, ~32k sparse columns).
-4. **Targets:** Morgan fingerprint, radius 2, 1,024 bits. **Model:** Ridge (v0.1) → deep residual MLP (v0.3b).
-5. **Candidates:** library molecules whose exact mass falls in the per-adduct, instrument-offset-corrected window (centred, half-width max(3 ppm, 3.5σ)).
-6. **Ranking:** cosine similarity between predicted and candidate fingerprints. For a test molecule with several spectra, the predicted fingerprints are averaged and the mass windows intersected (**molecule-level pooling**, +0.03 to +0.06 MRR).
+4. **Targets:** Morgan fingerprint, radius 2, 1,024 bits. **Model:** Ridge (v0.1) → deep residual MLP (v0.3b, 633k training spectra).
+5. **Candidates:** a library of 684,568 molecules (252,418 training molecules + 432,150 COCONUT natural products, v0.4) filtered to those whose exact mass falls in the per-adduct, instrument-offset-corrected window (centred, half-width max(3 ppm, 3.5σ)).
+6. **Ranking:** `z(cosine(predicted, candidate fingerprint) within the window) + 0.15 · pop`, where `pop = ln(1+substance records) + ln(1+PubMed articles)` is a public PubChem documentation prior (v0.4b). For a test molecule with several spectra, the predicted fingerprints are averaged and the mass windows intersected (**molecule-level pooling**, +0.03 to +0.06 MRR).
 
 **Validation that avoids the usual traps.** 80/20 split grouped by Murcko scaffold computed with stereo removed; every acyclic molecule is its own group; any validation molecule whose canonical key is in train is hard-removed and the overlap is `assert`ed to be zero. Tautomer canonicalisation is cached. Seeds are fixed (42). Scores are reported on two slices: the **enveda-180 validation slice** (test-like acquisition and mass window; the primary slice) and the **mixed validation set** (2,000 spectra from all sources), both against a **230k-molecule candidate pool** (true molecules + 200k decoys) because a 30k pool badly flatters the score.
 
@@ -61,7 +65,17 @@ MRR@25 on the 230k-molecule benchmark pool. "Random" = candidates in the mass wi
 
 Each row changes one thing; the full record with confidence intervals, checks and caveats is in [`docs/EXPERIMENT_LOG.md`](docs/EXPERIMENT_LOG.md). Per-experiment tables are in [`results/`](results/).
 
-**Leaderboard:** 0.076 (v0.3b deep MLP, train-only library). This is the number that matters for the competition and it is far below the local benchmark for the reason given above.
+**Leaderboard (hidden test, MRR@25).** The number that matters for the competition; far below the local benchmark because most hidden molecules are not in the candidate library (see [Limitations](#limitations)).
+
+| Submission | Candidate library | Ranking | Leaderboard |
+|---|---|---|---:|
+| v0.3b deep MLP, train-only library | 252,418 training molecules | cosine | 0.076 |
+| v0.4a + COCONUT | + 432,150 = 684,568 | cosine | 0.128 |
+| **v0.4b + popularity prior (w = 0.15)** | same | z(cosine) + 0.15·pop | **0.146** |
+| prior weight 0.30 | same | z(cosine) + 0.30·pop | 0.140 |
+| v0.4c + PubChem mass-window channel (library bonus 2, w = 0.30) | + PubChem structures in each window | z(cosine) + 0.30·pop (+ bonus) | 0.142 |
+
+An early Ridge baseline notebook run on a tiny sample scored 0.0 (uninformative).
 
 ---
 
@@ -162,33 +176,61 @@ The v0.3 verdict was a small-data artefact. With nested training tiers up to 633
 Tables: [`results/scale_scores.csv`](results/scale_scores.csv), [`scale_bootstrap.csv`](results/scale_bootstrap.csv), [`scale_novelty.csv`](results/scale_novelty.csv), [`scale_auc.csv`](results/scale_auc.csv).
 
 ### Candidate-pool cost (P7a) and pooling check
-Adding 432k COCONUT structures as decoys (true molecule still in the pool) lowers the deep model's score by about 0.11 on natural-product-like validation sources (median candidates grow 3–5×), while `model − random` stays flat or rises: the cost is more same-mass isomers, not a worse model. Tables: [`results/p7a_pool_cost.csv`](results/p7a_pool_cost.csv), [`p7a_pool_cost_by_source.csv`](results/p7a_pool_cost_by_source.csv), [`pooling_check.csv`](results/pooling_check.csv).
+Adding 432k COCONUT structures as decoys (true molecule still in the pool) lowers the deep model's score by about 0.11–0.13 on natural-product-like validation sources (median candidates grow 2–5×), while `model − random` stays flat or rises: the cost is more same-mass isomers, not a worse model. Tables: [`results/p7a_pool_cost.csv`](results/p7a_pool_cost.csv), [`p7a_pool_cost_by_source.csv`](results/p7a_pool_cost_by_source.csv), [`pooling_check.csv`](results/pooling_check.csv).
+
+### Candidate pool and ranking prior — the leaderboard levers (P7, v0.4)
+**COCONUT (+0.052).** A train-only library cannot contain unseen molecules. Adding 432,150 COCONUT natural products (structures only, no spectra) raised the leaderboard from 0.076 to 0.128 even though a larger pool costs reachable molecules about 0.13 MRR (2–5× more same-mass isomers):
+
+![Cost of a realistic pool](reports/v02_2_pool_cost_by_source.png)
+
+A rough decomposition (an estimate, not a measurement): of the 0.128, ≈0.063 comes from molecules also in the training set and ≈0.065 from COCONUT-only molecules, i.e. roughly 12–19% of hidden molecules.
+
+**Popularity prior (+0.018).** Among same-mass candidates, the better-documented structure is more often the answer. Score = `z(cosine within the mass window) + w · pop` with the public PubChem popularity prior (`dmitriigluzdov/casmi26-pubchem-popularity-prior`): w = 0.15 → **0.146**, w = 0.30 → 0.140 (saturates, in line with that dataset's own warning).
+
+**PubChem mass-window channel (built, benchmarked, neutral).** Because ~70% of hidden molecules are in neither the training set nor COCONUT, a channel adds every PubChem structure (105.9M, mass-sorted) inside each query's window, fingerprinted on the fly (tens to thousands per window):
+
+![PubChem window sizes](reports/v02_3_pubchem_window_sizes.png)
+
+Merged naively, thousands of PubChem isomers out-score library candidates, so library candidates get a source bonus. On labelled validation molecules (A: truth in library, PubChem off; B: truth removed from the library, PubChem on; C: truth in library, PubChem on) a bonus of 2 keeps C within ≈0.05 of A while B retains 0.13–0.26:
+
+![PubChem benchmark grid](reports/v02_4_pubchem_benchmark_grid.png)
+
+The benchmark predicted +0.01 to +0.05 for the submitted setting; the leaderboard moved **+0.002** (0.140 → 0.142 at the same weight):
+
+![Predicted vs observed](reports/v02_5_pubchem_predicted_vs_observed.png)
+
+Three explanations fit and were not separated: the benchmark is optimistic (known, well-documented truths with analogues in training); fewer hidden molecules are in PubChem than assumed; the cosine ranker cannot place the answer among thousands of isomers. The channel is implemented (`USE_TIER` in `kaggle/casmi_infer.ipynb`) and switched **off**. Tables: [`results/p7d_tier_benchmark.csv`](results/p7d_tier_benchmark.csv).
+
+**Tooling.** Training takes ~2 h on a Kaggle GPU, so the trained model, the training part of the library and the feature settings are *frozen* into a dataset and an inference-only notebook (`kaggle/casmi_infer.ipynb`, minutes, no GPU) runs the pool and ranking experiments. See [`kaggle/README.md`](kaggle/README.md).
 
 ---
 
 ## Limitations
-- **Candidate pool.** With a train-only library the Kaggle score was 0.076. A rough overlap estimate (0.076 ÷ ~0.6 molecule-level MRR when the truth is in the library) suggests only ~12–14% of hidden-test molecules are reachable. This is an inference, not a measurement.
-- **Domain gap.** Local validation is dominated by lab-library chemistry. At tier D every enveda-180 validation molecule has a training neighbour at Tanimoto ≥ 0.4, so that slice partly measures near-neighbour recognition. For genuinely novel molecules (< 0.3) the gain is unconfirmed (n = 97, CI includes 0). Expect natural-product test molecules to behave like the low-similarity bins.
-- **The benchmark pool's decoys** are mostly training molecules at tier D (no leak of the validation truth, but unlike the test situation).
-- **One seed per run**; CIs cover validation-query sampling, not training randomness. MLP hyper-parameters were tuned at tier A and early-stopped on BCE, not on ranking.
-- **The visible `test.parquet` is a placeholder** drawn from training spectra (all 1,213 spectra have exact twins in train); statements derived from it (mass range, adduct mix) describe enveda-180 acquisition, not the hidden test.
+- **Candidate pool.** Only an estimated ~25–33% of hidden molecules are reachable at all (≈12–14% in the training set, ≈12–19% COCONUT-only); the rest score 0 whatever the ranker does. These shares are inferred from leaderboard differences and assumed molecule-level MRRs, not measured.
+- **Ranker.** Spectrum → fingerprint MLP with cosine ranking. No forward models (spectrum simulation for candidates), no analog propagation from similar training spectra, no trained re-ranker; public pipelines on a comparable pool score ~0.35, so this is the main gap.
+- **Score noise.** About 400 hidden molecules and an MRR of ~0.14 give a standard error of ≈0.014 per score. The prior weight (0.15 vs 0.30) and the PubChem channel (+0.002) are not distinguishable from noise.
+- **Domain gap.** Local validation is dominated by lab-library chemistry. At tier D every enveda-180 validation molecule has a training neighbour at Tanimoto ≥ 0.4; for genuinely novel molecules (< 0.3) the deep model's gain is unconfirmed (n = 97, CI includes 0). The PubChem benchmark is similarly optimistic (known, well-documented truths), which is the most likely reason it over-predicted.
+- **Mass-window calibration** (offsets and widths) was fitted on enveda-180 training spectra; whether the hidden test shares it is untested. Features stop at m/z 1,000 (hidden masses reach ~1,159 Da).
+- **The benchmark pool's decoys** are mostly training molecules at tier D (no leak of the validation truth, but unlike the test situation); the real library (684k) has more distractors than the 230k benchmark pool.
+- **One seed per run**; CIs cover validation-query sampling, not training randomness. MLP hyper-parameters were tuned at tier A and early-stopped on BCE, not on ranking; training uses ≤ 3 spectra per molecule (633k of 1.73M cleaned spectra).
+- **The visible `test.parquet` is a placeholder** drawn from training spectra (all 1,213 spectra have exact twins in train); Kaggle commit-run scores on it are meaningless, only the hidden-test rerun counts.
 - v0.1 benchmark numbers are not exactly reproducible (unseeded evaluation sample); later versions are seeded.
-- The Kaggle notebooks were run end-to-end in DEBUG mode locally; the full-size Ridge notebook has not been run on Kaggle (a full-size score of ~0.05 is an estimate, not a measurement).
 
 ## Repository layout
 ```
 README.md
 requirements.txt
+notebooks/casmi_v0_2.ipynb                v0.2 REPORT notebook: data exploration, method, all experiments, leaderboard, limitations (executed, no data needed)
 notebooks/enveda-casmi26-baseline.ipynb   v0.1 baseline + EDA/P3/P4/P5 cells (outputs kept for the v0.1 part)
-reports/                                  all figures (p2_* EDA, p3_* mass window, p4* features, p5* models, v01_* baseline)
-results/                                  per-experiment tables (scores, bootstrap CIs, novelty/source breakdowns, training histories)
+reports/                                  figures (p2_* EDA, p3_* mass window, p4*/p5* models, v01_* baseline, v02_* pool and PubChem channel)
+results/                                  per-experiment tables (scores, bootstrap CIs, novelty/source breakdowns, training histories, PubChem benchmark)
 docs/EXPERIMENT_LOG.md                    one entry per version: hypothesis, single change, numbers, caveats, decision
 src/                                      reusable modules: pipeline, benchmark, mass window, MLP, cache builders
-work/                                     experiment scripts (p3_ … p7a_) and the Kaggle-notebook generator
-kaggle/                                   Kaggle submission notebooks (Ridge baseline, deep MLP) + run instructions
+work/                                     experiment scripts (p3_ … p7d_), Kaggle-notebook source and builder, release-notebook builder
+kaggle/                                   Kaggle notebooks: training (+freeze), Ridge baseline, inference-only (casmi_infer), run instructions
 reference/v0_1_pipeline.py                condensed v0.1 code (reference only, not directly runnable)
 ```
-The Kaggle notebooks are generated from `work/kaggle_cells.py`; edit that, then run `python work/build_kaggle_notebook.py`.
+The Kaggle notebooks are generated from `work/kaggle_cells.py`; edit that, then run `python work/build_kaggle_notebook.py`. The report notebook is generated by `python work/release_eda.py && python work/build_release_notebook.py` (needs the local `artifacts/`, which are not committed; the notebook embeds the tables it plots).
 
 ## Reproducing
 Data is not included. Download the competition files from the Kaggle page into `data/` (`train.parquet`, `test.parquet`, `sample_submission.csv`).
@@ -201,17 +243,24 @@ python work/p4c_defect_bins.py             # v0.2c features + Ridge (needs ~10 G
 python work/p5b_build_data.py              # v0.3b: build tiers (~15 min)
 python work/p5b_fit.py deep D              # deep residual MLP at tier D (~50 min on Apple MPS)
 python work/p5b_score.py                   # score all tiers/models
+python work/p7a_pool_cost.py               # cost of the larger (COCONUT) pool
+python src/build_coconut_cache.py          # COCONUT keys/masses/fingerprints (needs the public COCONUT Kaggle dataset in data/external/coconut/)
+python work/p7d_tier_benchmark.py          # PubChem-channel benchmark (needs the PubChem tier arrays, ~9 GB, in data/external/pubchem_tier/)
 ```
-Notes: `src/v1_pipeline.py` still loads the v0.1 decoy files (`dec_keys.npy`, `dec_fp_n.npy`, `dec_mass.npy`) from the working directory; they are produced by the v0.1 notebook (they are not included here, 830 MB). The Ridge solver builds a ~6–8 GB Gram matrix and a 16 GB machine cannot run it alongside GPU training; scripts expect the layout above (`data/`, `artifacts/`). To submit, follow [`kaggle/README.md`](kaggle/README.md); internet is disabled in the competition notebooks, so any external candidate set must be attached as a Kaggle dataset.
+Notes: `src/v1_pipeline.py` still loads the v0.1 decoy files (`dec_keys.npy`, `dec_fp_n.npy`, `dec_mass.npy`) from the working directory; they are produced by the v0.1 notebook (they are not included here, 830 MB). The Ridge solver builds a ~6–8 GB Gram matrix and a 16 GB machine cannot run it alongside GPU training; scripts expect the layout above (`data/`, `artifacts/`). To submit, follow [`kaggle/README.md`](kaggle/README.md): train once (or restore the cached features), freeze the model and the training part of the library, then run `kaggle/casmi_infer.ipynb` with its settings block (`POP_WEIGHT`, `USE_TIER`, `TIER_LIB_BONUS`, `WINDOW_SCALE`). Internet is disabled in the competition notebooks, so COCONUT, the popularity prior and the frozen model are attached as Kaggle datasets.
 
 ## Data, rules and licences
 - Competition data is not redistributed here. Figures and tables are derived from it; the competition data are reported to be CC BY-NC 4.0, so keep the project non-commercial and credit the sources.
-- The optional COCONUT candidate cache is built from the Kaggle dataset `prvsiyan/coconut-casmi26-candidates` (CC BY-NC-SA 4.0); credit the author if you use it.
+- The COCONUT candidate cache is built from the Kaggle dataset `prvsiyan/coconut-casmi26-candidates` (CC BY-NC-SA 4.0); credit the author if you use it.
+- The popularity prior and the PubChem tier come from `dmitriigluzdov/casmi26-pubchem-popularity-prior` (PubChem data, courtesy of the U.S. National Library of Medicine; LOTUS counts CC BY 4.0; NPAtlas CC BY-NC 4.0; see that dataset's README). Comparisons with public pipelines are quoted from the public notebook *CASMI 26: The Data Behind Spectra to Structures* and the notebooks credited there.
+- The frozen model and run-cache datasets contain competition-derived data and should stay private.
 - **Check the competition rules on code sharing before making this repository public while the competition is running** (final submission 2026-12-14). Rules wording on external data and notebook requirements was confirmed (public external data and pretrained models are allowed; submissions only via offline Notebooks, ≤ 9 h), but the code-sharing clause has not been read from the Rules page by the author.
 - No software licence has been chosen yet.
 
 ## Roadmap
-1. External candidate pool: COCONUT (cache built), then a mass-sorted PubChem channel, with a popularity prior that does not leak train/COCONUT origin.
-2. Learned reranker over the top candidates (Ridge cosine + MLP probability + signed mass error).
+1. **Close the ranker gap**: analog propagation from similar training spectra and/or public pretrained fingerprint networks and forward models (candidate-side spectrum simulation), fused with the MLP cosine; judge on a similarity-controlled validation slice and on the leaderboard.
+2. **Check the mass-window calibration on the hidden test** (`WINDOW_SCALE` probe in `kaggle/casmi_infer.ipynb`).
 3. Similarity-controlled validation (held-out molecule clusters at Tanimoto < 0.4) and a natural-product hold-out before trusting absolute numbers.
 4. Re-tune the deep MLP at scale (MRR-aligned early stopping, multiple seeds, all 1.73M spectra).
+5. Revisit the PubChem channel only with a stronger ranker (it was neutral with fingerprint cosine).
+

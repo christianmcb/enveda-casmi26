@@ -9,4 +9,6 @@ pyarrow
 matplotlib
 tqdm
 torch      # deep MLP (src/mlp.py); developed with 2.14.1 on Apple MPS
-nbformat   # only for work/build_kaggle_notebook.py
+nbformat   # work/build_kaggle_notebook.py and work/build_release_notebook.py
+nbclient    # only for work/build_release_notebook.py (executes the report notebook)
+ipykernel   # kernel for the above

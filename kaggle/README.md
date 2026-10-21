@@ -15,6 +15,22 @@ Run each notebook separately (the caches in /kaggle/working are per notebook, so
 5. Set `DEBUG = False` and run all. Expect roughly 1.5-3 hours (unmeasured on Kaggle; on a Mac with 8 cores + Apple GPU: canonicalisation ~5 min, features ~4 min, Ridge ~10-25 min, deep MLP ~50 min). Timings are printed.
 6. Submit: "Save Version" -> "Save & Run All (Commit)". The notebook writes `/kaggle/working/submission.csv` which is the file Kaggle uses when you submit the notebook version.
 
+## Fast iteration: freeze once, then infer in minutes (added 2026-10-21)
+A full training notebook takes ~2 h (canonicalisation 22 min, features, ~1 h deep MLP), and almost none of it depends on the candidate pool or the popularity prior. So:
+1. **Train + freeze (once per model change).** Run `casmi_submission_deep.ipynb` as usual. With `FREEZE = True` (default) it writes `/kaggle/working/frozen/`: `deep_best.pt` (weights), `keep.npy` (input columns), `frozen_meta.json` (feature settings, calibration offsets, sizes), `train_library.parquet` + `train_library_fp.npy` (the TRAINING part of the library; COCONUT and the popularity table are read from their own datasets). About 0.6 GB.
+   - **Skip the 2 h for the run that already exists:** attach that earlier notebook's output as an input and set `RESTORE_CACHE_DIR = "auto"` (first config cell). The notebook copies `canon_cache.parquet`, `X_train.npz`, `deep_pred.npz` and `deep_best.pt` into `/kaggle/working`, skips canonicalisation/features/training and only freezes (~10-20 min). Valid only if the training data and the training code are unchanged.
+2. **Make the frozen files an input.** On the finished run: Output tab -> New Dataset -> select the `frozen` folder -> private. (Keep it private; it contains the trained model and the training molecules' SMILES.)
+3. **Infer.** Import `casmi_infer.ipynb`, attach: the competition data, the frozen dataset, the COCONUT cache dataset, and (if `POP_WEIGHT > 0`) `dmitriigluzdov/casmi26-pubchem-popularity-prior`. No GPU needed (CPU sessions also queue less). Edit only `POP_WEIGHT` / `EXTRA_POOL_DIR` in the config cell; the run takes minutes. Commit it and submit its `submission.csv`.
+4. The inference notebook is also the safe choice for the hidden-test rerun: it does not retrain, so it cannot run into the 9 h limit.
+Local equivalence test: a frozen DEBUG run + `casmi_infer` must write the same `submission_deep_debug.csv` as the training run (checked 2026-10-21, see docs/EXPERIMENT_LOG).
+
+## Running casmi_infer with the PubChem channel (P7d, added 2026-10-21)
+Edit ONLY the block `SETTINGS: THE ONLY LINES TO EDIT` at the top of the config cell: `POP_WEIGHT`, `USE_TIER`, `TIER_LIB_BONUS` (and leave `TIER_WORKERS = 4`). The log prints a `SETTINGS:` line with what was actually used. The values to use are in docs/EXPERIMENT_LOG.md (entry "P7d").
+- `USE_TIER = False` reproduces the current 0.146 submission (w = 0.15).
+- `USE_TIER = True` adds PubChem structures from each query's mass window (fingerprinted on the fly, ~0.5 s per molecule locally), scored with the same prior; `TIER_LIB_BONUS` is a source prior in z-score units that favours train + COCONUT candidates.
+- Attach the same inputs as before; the tier arrays are inside the popularity dataset (`dmitriigluzdov/casmi26-pubchem-popularity-prior`). The first cells check that the six tier files exist and stop with a clear message if not. A GPU is not needed.
+- A commit run does NOT use a daily submission; only the Submit click does. Test `USE_TIER = True` with a commit first (check runtime, no errors, the `share of PubChem-tier guesses` line), then submit the version with the final settings.
+
 ## What to expect from the score (important)
 - The visible `test.parquet` is a **placeholder drawn from the training spectra** (all 1,213 spectra have exact twins in train). Its score, and the "how many test molecules are in train" probe printed at the end, mean nothing. Only the hidden-test rerun scores.
 - The candidate library is every training molecule (~254k) **plus ~432k COCONUT natural products** (`EXTRA_POOL_DIR = "auto"`). COCONUT-only molecules have no spectra, so their value cannot be validated locally; the local benchmark shows only the COST of the bigger pool (about -0.11 MRR on NP-like validation molecules, docs/EXPERIMENT_LOG.md "P7a"). The leaderboard score is the first measurement of the gain.

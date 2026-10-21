@@ -68,6 +68,12 @@ FINAL_CHOICE = "deep"        # which model is copied to submission.csv: "baselin
 EXTRA_CANDIDATES_PATH = None # optional .parquet/.csv with a 'smiles' column of extra candidate structures. (canonicalised in the notebook: slow for >100k rows; prefer EXTRA_POOL_DIR).
 EXTRA_POOL_DIR = "auto"      # folder with the PRE-COMPUTED COCONUT cache (coconut_v1.parquet + coconut_fp_v1.npy from src/build_coconut_cache.py).
                              # "auto": look in /kaggle/input/** then ./artifacts. None: train-only library. Allowed: the Code Requirements permit freely and publicly available external data.
+POP_WEIGHT = 0.0             # P7c popularity prior: score = z(cosine within the mass window) + POP_WEIGHT * pop. 0.0 = off (pure cosine, = P7b). Public pipelines use ~0.15.
+POP_PATH = "auto"            # pool_popularity.csv of the public Kaggle dataset dmitriigluzdov/casmi26-pubchem-popularity-prior ("auto": search /kaggle/input/** then ./data/external/pop_prior).
+FREEZE = True                # after training, save the model + library + feature settings into <WORK>/frozen: input of the inference-only notebook (casmi_infer)
+RESTORE_CACHE_DIR = None     # None | "auto" | folder: copy canon_cache.parquet / X_train.npz / deep_pred.npz / deep_best.pt from an earlier run's output (attach that notebook
+                             # output as an input) so this run skips canonicalisation, feature building and training. Only valid if the training data and code are unchanged.
+if os.environ.get("CASMI_POP_WEIGHT"): POP_WEIGHT = float(os.environ["CASMI_POP_WEIGHT"])      # (override used for local testing)
 SEED = 42
 
 # --- locate the data (Kaggle input folder, or ./data when run locally) ---
@@ -100,6 +106,24 @@ try:
 except ImportError:
     print("CPU cores:", os.cpu_count())
 if DEVICE == "cpu" and not DEBUG: print("WARNING: no GPU found - the deep MLP will be several times slower (enable Settings > Accelerator > GPU).")
+''')
+
+# =====================================================================================================================================
+code("restore_cache", r'''
+# ======================================== 1a. OPTIONAL: RESTORE CACHES FROM AN EARLIER RUN ========================================
+# WHY: canonicalisation (~22 min on Kaggle), feature building and the deep MLP training (~1 h) do not depend on the library or the
+# popularity prior. Attaching a previous notebook's output and setting RESTORE_CACHE_DIR = "auto" lets a rerun skip all of them.
+if RESTORE_CACHE_DIR:
+    import shutil
+    d_ = RESTORE_CACHE_DIR
+    if d_ == "auto":
+        hits = glob.glob("/kaggle/input/**/deep_best.pt", recursive=True)
+        d_ = os.path.dirname(hits[0]) if hits else None
+    if d_ is None: print("WARNING: RESTORE_CACHE_DIR = 'auto' but no earlier output (deep_best.pt) is attached -> everything is recomputed")
+    else:
+        for f_ in ("canon_cache.parquet", "X_train.npz", "deep_pred.npz", "deep_best.pt"):
+            src_, dst_ = os.path.join(d_, f_), os.path.join(WORK, f_)
+            if os.path.exists(src_) and not os.path.exists(dst_): shutil.copy(src_, dst_); tick(f"restored {f_} from {d_}")
 ''')
 
 # =====================================================================================================================================
@@ -173,6 +197,7 @@ class Library:
     def __init__(self, smiles, keys, mass, fp_unit):
         self.smiles, self.keys, self.mass, self.fp_unit = smiles, np.asarray(keys), np.asarray(mass), fp_unit
         self.order = np.argsort(self.mass); self.mass_sorted = self.mass[self.order]
+        self.pop, self.pop_w = None, 0.0        # optional popularity prior (one value per library row) and its weight; None = pure cosine
 
 def unit(A): return A / (np.linalg.norm(A, axis=1, keepdims=True) + 1e-9)
 ''')
@@ -271,6 +296,39 @@ tick(f"canonical molecules: {deep.key.nunique():,} | train spectra {int((deep.sp
 ''')
 
 # =====================================================================================================================================
+code("pool_defs", r'''
+# ======================================== 4b. EXTERNAL POOL + POPULARITY PRIOR (shared by the training and the inference notebook) ========================================
+def merge_coconut(lib_smiles, lib_keys, fp_u8, mass):
+    """Append the pre-computed COCONUT cache (EXTRA_POOL_DIR) to the library arrays. Structures already in the library win; one row per canonical key."""
+    d_ = EXTRA_POOL_DIR
+    if not d_: return lib_smiles, lib_keys, fp_u8, mass
+    if d_ == "auto":
+        hits = glob.glob("/kaggle/input/**/coconut_v1.parquet", recursive=True) + glob.glob("artifacts/coconut_v1.parquet")
+        d_ = os.path.dirname(hits[0]) if hits else None
+    if d_ is None:
+        print("WARNING: no COCONUT cache found -> library = training molecules only (expect a score near 0 on novel molecules)")
+        return lib_smiles, lib_keys, fp_u8, mass
+    C_ = pd.read_parquet(f"{d_}/coconut_v1.parquet"); cfp = np.load(f"{d_}/coconut_fp_v1.npy", mmap_mode="r")
+    assert len(C_) == len(cfp) and cfp.shape[1] == 1024, "COCONUT cache rows do not match its fingerprints"
+    keep = ~C_.key.isin(set(lib_keys)).values & ~C_.key.duplicated().values        # training structures win; one row per canonical key
+    idx_ = np.flatnonzero(keep); C_ = C_.iloc[idx_]
+    out = (list(lib_smiles) + C_.smiles.tolist(), list(lib_keys) + C_.key.tolist(), np.vstack([fp_u8, np.asarray(cfp[idx_])]), np.concatenate([mass, C_.mass.values]))
+    tick(f"+ {len(C_):,} COCONUT candidates from {d_}")
+    return out
+
+def attach_popularity(LIB, weight):
+    """P7c: PubChem documentation prior, ln(1+substances)+ln(1+PubMed)+..., joined on the metric key; unmatched keys get the median (neutral)."""
+    hits = glob.glob("/kaggle/input/**/pool_popularity.csv", recursive=True) + glob.glob("data/external/pop_prior/pool_popularity.csv")
+    path = hits[0] if POP_PATH == "auto" and hits else (POP_PATH if POP_PATH != "auto" else None)
+    if path is None: raise FileNotFoundError("POP_WEIGHT > 0 but pool_popularity.csv was not found: attach the dataset dmitriigluzdov/casmi26-pubchem-popularity-prior")
+    pp = pd.read_csv(path, usecols=["inchikey14", "pop"]).drop_duplicates("inchikey14").set_index("inchikey14")["pop"]
+    pop_ = pp.reindex(LIB.keys).values.astype(np.float32); miss_ = np.isnan(pop_)
+    pop_[miss_] = np.nanmedian(pop_)
+    LIB.pop, LIB.pop_w = pop_, float(weight)
+    tick(f"popularity prior ON: weight {weight}, {1 - miss_.mean():.1%} of the library matched, pop median {np.median(pop_):.2f}")
+''')
+
+# =====================================================================================================================================
 code("library", r'''
 # ======================================== 5. CANDIDATE LIBRARY ========================================
 # WHY: the model predicts a 1,024-bit Morgan fingerprint; candidates are library molecules whose exact mass fits the precursor and
@@ -294,6 +352,7 @@ deep = deep[deep.key.isin(MOL_IDX.index)].reset_index(drop=True)      # (RDKit p
 tick(f"library from training molecules: {len(mols):,}")
 
 lib_smiles, lib_keys = mols.normalized_smiles.tolist(), mols.key.tolist()
+N_TRAIN_LIB = len(lib_keys)                                            # rows [:N_TRAIN_LIB] of the library are the training molecules (saved by the freeze step)
 if EXTRA_CANDIDATES_PATH:                                              # optional external structures (check the competition rules first!)
     ex = pd.read_parquet(EXTRA_CANDIDATES_PATH) if EXTRA_CANDIDATES_PATH.endswith(".parquet") else pd.read_csv(EXTRA_CANDIDATES_PATH)
     ec = canonicalise(ex.smiles.tolist(), f"{WORK}/canon_extra_candidates.parquet")
@@ -303,33 +362,20 @@ if EXTRA_CANDIDATES_PATH:                                              # optiona
     lib_smiles += ex.smiles.tolist(); lib_keys += ex.key.tolist(); fp_u8 = np.vstack([fp_u8, efp]); mass = np.concatenate([mass, emass])
     tick(f"+ {len(ex):,} extra candidates")
 
-if EXTRA_POOL_DIR:                                                     # pre-computed external pool (COCONUT, ~432k natural products, no spectra)
-    d_ = EXTRA_POOL_DIR
-    if d_ == "auto":
-        hits = glob.glob("/kaggle/input/**/coconut_v1.parquet", recursive=True) + glob.glob("artifacts/coconut_v1.parquet")
-        d_ = os.path.dirname(hits[0]) if hits else None
-    if d_ is None:
-        print("WARNING: no COCONUT cache found -> library = training molecules only (expect a score near 0 on novel molecules)")
-    else:
-        C_ = pd.read_parquet(f"{d_}/coconut_v1.parquet"); cfp = np.load(f"{d_}/coconut_fp_v1.npy", mmap_mode="r")
-        assert len(C_) == len(cfp) and cfp.shape[1] == 1024, "COCONUT cache rows do not match its fingerprints"
-        keep = ~C_.key.isin(set(lib_keys)).values & ~C_.key.duplicated().values        # training structures win; one row per canonical key
-        idx_ = np.flatnonzero(keep); C_ = C_.iloc[idx_]
-        lib_smiles += C_.smiles.tolist(); lib_keys += C_.key.tolist()
-        fp_u8 = np.vstack([fp_u8, np.asarray(cfp[idx_])]); mass = np.concatenate([mass, C_.mass.values])
-        tick(f"+ {len(C_):,} COCONUT candidates from {d_}")
-        del C_, cfp
+lib_smiles, lib_keys, fp_u8, mass = merge_coconut(lib_smiles, lib_keys, fp_u8, mass)        # pre-computed external pool (COCONUT, ~432k natural products, no spectra)
 LIB = Library(lib_smiles, lib_keys, mass, unit(fp_u8.astype(np.float32)))
+if POP_WEIGHT > 0: attach_popularity(LIB, POP_WEIGHT)
 tick(f"library ready: {len(LIB.keys):,} molecules, mass {LIB.mass_sorted[0]:.1f}-{LIB.mass_sorted[-1]:.1f}")
 ''')
 
 # =====================================================================================================================================
-code("features", r'''
+code("feature_defs", r'''
 # ======================================== 6. SPECTRUM FEATURES ========================================
 # WHY (project findings P4a-c): features = fragment peaks + NEUTRAL LOSSES (precursor m/z - fragment m/z), each binned as
 # nominal mass x 0.02 Da MASS-DEFECT sub-bins (the digits after the decimal point carry elemental composition), sqrt intensity,
 # unit length per block, plus acquisition metadata. Sparse matrices (about 130 non-zeros per spectrum).
 import scipy.sparse as sp
+import pyarrow.parquet as pq
 MAX_MZ, DEFECT_LO, DEFECT_HI, W = 1000, -0.05, 0.25, 0.02
 K_SUB = int(round((DEFECT_HI - DEFECT_LO) / W)); PER = K_SUB + 1          # 15 sub-bins + 1 overflow column per nominal mass
 
@@ -387,6 +433,11 @@ def read_rows_meta(row_ids):
             t.index = m; parts.append(t)
     return pd.concat(parts).sort_index().reset_index(drop=True)
 
+''')
+
+# =====================================================================================================================================
+code("features", r'''
+# ======================================== 6b. BUILD THE TRAINING FEATURES ========================================
 # the Ridge-only notebook never uses most spectra: keep only its training rows + the sanity holdout (saves minutes of feature building).
 # (The candidate library above was already built from ALL molecules.)
 if not RUN_DEEP:
@@ -451,6 +502,7 @@ def rank_queries(Q, lo, hi, lib, k=25):
             if len(idx) == 0: idx = lib.order[np.argsort(np.abs(lib.mass_sorted - c))[:k]]
         ncand[i] = len(idx)
         s = lib.fp_unit[idx] @ Q[i]
+        if lib.pop is not None and len(idx) > 1: s = (s - s.mean()) / (s.std() + 1e-6) + lib.pop_w * lib.pop[idx]      # P7c prior (off when lib.pop is None)
         if len(idx) > k:
             part = np.argpartition(-s, k)[:k]; order = part[np.argsort(-s[part])]
         else:
@@ -515,6 +567,124 @@ def holdout_sanity(P_hold, name, max_queries=3000):
 ''')
 
 # =====================================================================================================================================
+code("tier_defs", r'''
+# ======================================== P7d. PUBCHEM MASS-WINDOW CHANNEL ========================================
+# WHY: ~70% of the hidden-test molecules are in neither the training set nor COCONUT (P7b/P7c leaderboard decomposition). PubChem (105.9M structures, sorted by
+# neutral mass, with aligned documentation counts) is the pool that can contain them. We never fingerprint the whole tier: only the structures inside each
+# query's mass window (a few hundred to a few thousand), on the fly, and rank them together with the library candidates by
+#     z(cosine within the window) + w * pop,       pop = ln(1 + substance records) + ln(1 + PubMed articles)
+# (the same prior as the library's pool_popularity.csv, so the two sources are comparable). Tier rows whose raw InChIKey14 is already a library key are
+# skipped (the library copy wins). The final top list is deduplicated on the METRIC key (tautomer-canonical InChIKey14), computed for tier rows only
+# for the best `topn` candidates (tautomer canonicalisation is ~20 ms per molecule).
+import multiprocessing as mp
+from rdkit import Chem
+from rdkit.Chem import rdFingerprintGenerator
+from rdkit.Chem.MolStandardize import rdMolStandardize
+from rdkit import RDLogger
+RDLogger.DisableLog("rdApp.*")                                  # PubChem has structures RDKit cannot parse (e.g. odd valences): they are skipped, not worth a log line
+
+class Tier:
+    """Memory-mapped PubChem tier: sorted neutral masses, SMILES bytes + offsets, documentation counts, raw InChIKey14."""
+    def __init__(self, root):
+        def find(name):
+            for pat in (f"{root}/{name}.npy", f"{root}/**/{name}.npy"):
+                hits = glob.glob(pat, recursive=True)
+                if hits: return hits[0]
+            raise FileNotFoundError(f"{name}.npy not found under {root}")
+        ld = lambda n: np.load(find(n), mmap_mode="r")
+        self.mass, self.off, self.smi, self.lsid, self.lpmid, self.ik = (ld(n) for n in ("pc_mass", "pc_off", "pc_smiles", "pc_lsid", "pc_lpmid", "pc_ik14"))
+        n = len(self.mass); assert len(self.off) == n + 1 and len(self.lsid) == len(self.lpmid) == len(self.ik) == n, "tier arrays are not row-aligned"
+    def window(self, lo, hi): return tuple(int(x) for x in np.searchsorted(self.mass, [lo, hi]))
+    def smiles(self, rows): return [bytes(self.smi[self.off[r]:self.off[r + 1]]).decode() for r in rows]
+    def pop(self, rows): return self.lsid[rows].astype(np.float32) + self.lpmid[rows].astype(np.float32)
+    def ik14(self, rows): return [x.decode() if isinstance(x, bytes) else str(x) for x in self.ik[rows]]
+
+def find_tier_dir():
+    if os.environ.get("CASMI_TIER_DIR"): return os.environ["CASMI_TIER_DIR"]
+    hits = glob.glob("/kaggle/input/**/pc_lsid.npy", recursive=True) + glob.glob("data/external/pubchem_tier/pc_lsid.npy")    # dataset root: pc_mass/pc_off/pc_smiles may sit in a subfolder
+    return os.path.dirname(hits[0]) if hits else None
+
+_fpg = _taut_ = None
+def _fp_of(smi):
+    global _fpg
+    if _fpg is None: _fpg = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=1024)
+    m = Chem.MolFromSmiles(smi)
+    return None if m is None else _fpg.GetFingerprintAsNumPy(m).astype(np.uint8)
+def _metric_key(smi):
+    global _taut_
+    if _taut_ is None: _taut_ = rdMolStandardize.TautomerEnumerator()
+    try:
+        m = Chem.MolFromSmiles(smi)
+        return None if m is None else Chem.MolToInchiKey(_taut_.Canonicalize(m))[:14]
+    except Exception: return None
+
+def _pmap(fn, items, pool):
+    items = list(items)
+    if pool is None or len(items) < 400: return [fn(x) for x in items]
+    return pool.map(fn, items, chunksize=max(50, len(items) // (4 * pool._processes)))
+
+def rank_with_tier(Q, lo, hi, lib, tier, w, k=25, topn=60, fp_cache=None, key_cache=None, pool=None, lib_keyset=None, lib_bonus=0.0, progress=0):
+    """Per query: library candidates (mass window) + PubChem tier candidates (same window), scored z(cosine) + w * pop, top `topn`, deduplicated on the
+    metric key, first k kept. Returns, per query, a list of (metric_key, smiles, source) with source 'lib' or 'tier'.
+    lib_bonus: SOURCE PRIOR added to every library (train + COCONUT) candidate's score: a structure we have seen is a priori far more likely to be the answer
+    than one of the thousands of same-mass PubChem isomers (z-score units, like w * pop)."""
+    fp_cache = {} if fp_cache is None else fp_cache; key_cache = {} if key_cache is None else key_cache
+    lib_keyset = set(lib.keys) if lib_keyset is None else lib_keyset
+    out = []
+    t_start = time.time()
+    for i in range(len(Q)):
+        if progress and i and i % progress == 0: tick(f"  PubChem channel: {i:,}/{len(Q):,} molecules ({(time.time() - t_start) / i:.2f} s each, {len(fp_cache):,} tier structures fingerprinted)")
+        a, b = np.searchsorted(lib.mass_sorted, [lo[i], hi[i]]); idx = lib.order[a:b]
+        ta, tb = tier.window(lo[i], hi[i]); rows = np.arange(ta, tb)
+        if len(rows):
+            rows = rows[[ik not in lib_keyset for ik in tier.ik14(rows)]]            # library copy wins
+            need = [r for r in rows if r not in fp_cache]
+            for r, f in zip(need, _pmap(_fp_of, tier.smiles(need), pool)): fp_cache[r] = f
+            rows = np.array([r for r in rows if fp_cache[r] is not None], dtype=np.int64)
+        if len(idx) == 0 and len(rows) == 0:                                          # nothing at all: widen the library window as rank_queries does
+            c = 0.5 * (lo[i] + hi[i])
+            for ppm in (10, 25, 50, 100, 250):
+                a, b = np.searchsorted(lib.mass_sorted, [c * (1 - ppm * 1e-6), c * (1 + ppm * 1e-6)])
+                if b > a: idx = lib.order[a:b]; break
+            if len(idx) == 0: idx = lib.order[np.argsort(np.abs(lib.mass_sorted - c))[:k]]
+        s_lib = lib.fp_unit[idx] @ Q[i]
+        s_tier = unit(np.stack([fp_cache[r] for r in rows]).astype(np.float32)) @ Q[i] if len(rows) else np.zeros(0, np.float32)
+        s = np.concatenate([s_lib, s_tier])
+        if (w or lib_bonus) and len(s) > 1:
+            pop = np.concatenate([lib.pop[idx] if lib.pop is not None else np.zeros(len(idx), np.float32), tier.pop(rows) if len(rows) else np.zeros(0, np.float32)])
+            s = (s - s.mean()) / (s.std() + 1e-6) + w * pop
+            s[:len(idx)] += lib_bonus
+        top = np.argsort(-s)[:topn]
+        cand = [("lib", int(idx[j])) if j < len(idx) else ("tier", int(rows[j - len(idx)])) for j in top]
+        need = [r for src, r in cand if src == "tier" and r not in key_cache]
+        smi_need = tier.smiles(need)
+        for r, sm, key in zip(need, smi_need, _pmap(_metric_key, smi_need, pool)): key_cache[r] = (sm, key)
+        seen, res = set(), []
+        for src, r in cand:
+            key, sm = (lib.keys[r], lib.smiles[r]) if src == "lib" else (key_cache[r][1], key_cache[r][0])
+            if key is None or key in seen: continue
+            seen.add(key); res.append((key, sm, src))
+            if len(res) == k: break
+        out.append(res)
+    return out
+
+def make_submission_tier(P_test, name, tier, w, lib_bonus=0.0, workers=4):
+    """Like make_submission, with the PubChem channel."""
+    keys, Pm, L, H, nbad = pool_molecules(P_test, test.molecule_id.values, test_lo, test_hi)
+    pool = mp.get_context("fork").Pool(workers) if workers > 1 else None
+    try: ranked = rank_with_tier(Pm, L, H, LIB, tier, w, pool=pool, lib_bonus=lib_bonus, progress=50)
+    finally:
+        if pool is not None: pool.close()
+    sub = pd.DataFrame({"molecule_id": keys, "smiles": [";".join(sm for _, sm, _ in r) for r in ranked]})
+    sub = sub.set_index("molecule_id").loc[sample.molecule_id].reset_index()
+    n = validate_submission(sub, sample.molecule_id)
+    path = f"{WORK}/submission_{name}{'_debug' if DEBUG else ''}.csv"; sub.to_csv(path, index=False)
+    share = np.mean([src == "tier" for r in ranked for _, _, src in r]) if ranked else float("nan")
+    tick(f"{path}: {len(sub)} molecules | guesses per molecule: median {n.median():.0f}, min {n.min()} | share of PubChem-tier guesses {share:.1%}")
+    return sub, ranked, Pm
+''')
+
+# =====================================================================================================================================
 code("ridge_model", r'''
 # ======================================== 9. BASELINE MODEL: RIDGE ========================================
 # Ridge(alpha=1) solved with the normal equations on sparse features (sklearn's sparse path fits one target at a time: far too slow
@@ -569,7 +739,7 @@ if RUN_BASELINE:
 ''')
 
 # =====================================================================================================================================
-code("deep_model", r'''
+code("mlp_defs", r'''
 # ======================================== 10. DEEP MODEL: RESIDUAL MLP ========================================
 # sparse spectrum features -> Linear(1024) -> 4 pre-norm residual blocks (LayerNorm) -> 1,024 sigmoid outputs, trained with BCE on the
 # Morgan bits. Early stopping on a scaffold-grouped 5% holdout INSIDE the training rows (the sanity holdout is never touched).
@@ -630,6 +800,11 @@ def predict_mlp(net, X, bs=1024):
             out.append(torch.sigmoid(net(xb)).cpu().numpy())
     return np.vstack(out).astype(np.float32)
 
+''')
+
+# =====================================================================================================================================
+code("deep_model", r'''
+# ======================================== 10b. DEEP MODEL: TRAIN + PREDICT ========================================
 DEEP_FILE = f"{WORK}/deep_pred{'_debug' if DEBUG else ''}.npz"
 if RUN_DEEP:
     if os.path.exists(DEEP_FILE):
@@ -646,6 +821,29 @@ if RUN_DEEP:
     holdout_sanity(P_hold_deep, "deep MLP")
     SUB_DEEP, RANKED_DEEP, _ = make_submission(P_test_deep, "deep")
     if FINAL_CHOICE == "deep": publish(SUB_DEEP, "deep MLP")
+''')
+
+# =====================================================================================================================================
+code("freeze", r'''
+# ======================================== 10c. FREEZE: everything the inference-only notebook needs ========================================
+# WHY: the hidden-test rerun and every new experiment (prior weight, new pools) would otherwise repeat canonicalisation + features + training.
+# Frozen = trained weights, the training-column selection, feature settings, calibration offsets and the TRAINING part of the library (fingerprints
+# + masses). COCONUT and the popularity table are NOT copied: the inference notebook reads them from their own datasets.
+if FREEZE and RUN_DEEP:
+    assert not EXTRA_CANDIDATES_PATH, "EXTRA_CANDIDATES_PATH rows are not frozen; use EXTRA_POOL_DIR"
+    import shutil
+    fdir = f"{WORK}/frozen"; os.makedirs(fdir, exist_ok=True)
+    ckpt = f"{WORK}/deep_best{'_debug' if DEBUG else ''}.pt"
+    assert os.path.exists(ckpt), f"{ckpt} missing: the deep model has to be trained (or restored) before it can be frozen"
+    keep = np.flatnonzero(np.asarray((X_ALL[SPLIT_TRAIN] != 0).sum(0)).ravel() > 0)              # same selection as the training step
+    shutil.copy(ckpt, f"{fdir}/deep_best.pt"); np.save(f"{fdir}/keep.npy", keep)
+    pd.DataFrame({"smiles": LIB.smiles[:N_TRAIN_LIB], "key": LIB.keys[:N_TRAIN_LIB], "mass": LIB.mass[:N_TRAIN_LIB]}).to_parquet(f"{fdir}/train_library.parquet")
+    np.save(f"{fdir}/train_library_fp.npy", fp_u8[:N_TRAIN_LIB])
+    json.dump({"bias": {k: float(v) for k, v in BIAS.items()}, "hw": {k: float(v) for k, v in HW.items()},
+               "top_inst": [str(x) for x in FEAT.top_inst], "cols": [str(x) for x in FEAT.cols], "ce_med": float(FEAT.ce_med),
+               "n_in": int(len(keep)), "n_cols_full": int(X_ALL.shape[1]), "n_library": int(N_TRAIN_LIB), "debug": bool(DEBUG), "seed": SEED},
+              open(f"{fdir}/frozen_meta.json", "w"), indent=1)
+    tick("frozen -> " + fdir + ": " + ", ".join(f"{os.path.basename(f)} {os.path.getsize(f) / 1e6:.0f} MB" for f in sorted(glob.glob(f"{fdir}/*"))))
 ''')
 
 # =====================================================================================================================================
@@ -669,5 +867,119 @@ ranked, ncand = rank_queries(Pm, L, H, LIB)
 best_cos = np.array([float(LIB.fp_unit[r[0]] @ q) for r, q in zip(ranked, Pm)])
 print(f"\nPROBE: cosine between the predicted fingerprint and the best candidate: median {np.median(best_cos):.3f}; "
       f"share of molecules with cosine > 0.9: {(best_cos > 0.9).mean():.1%} (for a validation molecule WITH its answer in the library this is typically ~0.6-0.8)")
+tick("done")
+''')
+
+
+# =====================================================================================================================================
+# INFERENCE-ONLY NOTEBOOK (casmi_infer): loads the frozen model + library, predicts the test spectra, ranks. Runs in minutes, needs no GPU.
+md("infer_title", """
+# Enveda CASMI 2026 — inference-only notebook (frozen deep MLP)
+Loads the artifacts frozen by the training notebook (`frozen/`: trained weights, training-column selection, feature settings, calibration offsets and the
+training part of the candidate library), adds the public COCONUT cache and the PubChem popularity prior, and writes `submission.csv`.
+It does no training and no canonicalisation, so it runs in minutes, and it is the notebook to submit for experiments on the **pool and ranking**
+(prior weight, extra pools) and for the hidden-test rerun.
+
+**Inputs to attach:** the competition data; the dataset made from the training notebook's `frozen/` folder; the COCONUT cache dataset; the
+popularity dataset (`dmitriigluzdov/casmi26-pubchem-popularity-prior`, only needed when `POP_WEIGHT > 0`). A GPU is not needed.
+""")
+
+# =====================================================================================================================================
+code("infer_config", r'''
+# ======================================== 1. CONFIG (inference only) ========================================
+import os, sys, glob, time, json, gc, queue, threading, warnings, re
+import numpy as np, pandas as pd
+warnings.filterwarnings("ignore")
+T0 = time.time()
+def rss_gb():
+    try:
+        import psutil; return psutil.Process().memory_info().rss / 1e9
+    except Exception: return float("nan")
+def tick(msg): print(f"[{(time.time() - T0) / 60:6.1f} min | {rss_gb():4.1f} GB] {msg}", flush=True)
+
+DEBUG = bool(int(os.environ.get("CASMI_DEBUG", "0")))   # only for local testing against a frozen DEBUG run
+
+# ############################################ SETTINGS: THE ONLY LINES TO EDIT ############################################
+# Values to use come from docs/EXPERIMENT_LOG.md (entry "P7d"). Leaderboard history: train-only 0.076 | + COCONUT 0.128 | + prior w=0.15 0.146 | w=0.30 0.140.
+POP_WEIGHT = 0.15            # popularity prior weight. score = z(cosine within the mass window) + POP_WEIGHT * pop.  0.0 = off (pure cosine).
+USE_TIER = False             # True = add the PubChem mass-window channel (P7d). Needs POP_WEIGHT > 0 and the popularity dataset (it holds the tier arrays).
+TIER_LIB_BONUS = 0.0         # only with USE_TIER: source prior added to every library (train + COCONUT) candidate, in z-score units. Higher = trust the library more.
+TIER_WORKERS = 4             # processes for fingerprinting / tautomer keys of the tier candidates (Kaggle gives 4 cores)
+WINDOW_SCALE = 1.0           # multiplies every per-adduct mass-window half-width (frozen: max(3 ppm, 3.5 sigma) fitted on enveda-180). 1.0 = as trained. >1 probes whether the hidden test needs wider windows.
+CENTRE_ON_OFFSET = True      # True: windows centred on the per-adduct instrument offset fitted on enveda-180 (+2.2 ppm for [M+H]+). False: centred on 0 (v0.1 style).
+EXTRA_POOL_DIR = "auto"      # COCONUT cache (coconut_v1.parquet + coconut_fp_v1.npy): "auto" = search /kaggle/input/** then ./artifacts. None = train-only library.
+# ##########################################################################################################################
+POP_PATH = "auto"            # pool_popularity.csv ("auto": search /kaggle/input/** then ./data/external/pop_prior)
+FROZEN_DIR = "auto"          # folder with frozen_meta.json ("auto": search /kaggle/input/**, then $CASMI_FROZEN_DIR, then ./kaggle_work/frozen)
+if os.environ.get("CASMI_POP_WEIGHT"): POP_WEIGHT = float(os.environ["CASMI_POP_WEIGHT"])      # (override used for local testing)
+if os.environ.get("CASMI_USE_TIER"): USE_TIER = bool(int(os.environ["CASMI_USE_TIER"]))
+if os.environ.get("CASMI_WINDOW_SCALE"): WINDOW_SCALE = float(os.environ["CASMI_WINDOW_SCALE"])
+if os.environ.get("CASMI_TIER_LIB_BONUS"): TIER_LIB_BONUS = float(os.environ["CASMI_TIER_LIB_BONUS"])
+SEED = 42
+
+def find_comp_dir():
+    if os.environ.get("CASMI_COMP_DIR"): return os.environ["CASMI_COMP_DIR"]
+    hits = glob.glob("/kaggle/input/**/test.parquet", recursive=True)
+    return os.path.dirname(hits[0]) if hits else "./data"
+COMP_DIR = find_comp_dir()
+TEST_PATH, SAMPLE_PATH = (os.path.join(COMP_DIR, f) for f in ("test.parquet", "sample_submission.csv"))
+WORK = os.environ.get("CASMI_WORK") or ("/kaggle/working" if os.path.isdir("/kaggle/working") else "./kaggle_work")
+os.makedirs(WORK, exist_ok=True)
+if FROZEN_DIR == "auto":
+    hits = glob.glob("/kaggle/input/**/frozen_meta.json", recursive=True)
+    FROZEN_DIR = os.path.dirname(hits[0]) if hits else (os.environ.get("CASMI_FROZEN_DIR") or "./kaggle_work/frozen")
+
+import torch
+DEVICE = "cuda" if torch.cuda.is_available() else ("mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu")
+print("torch", torch.__version__, "| device:", DEVICE, "| DEBUG =", DEBUG, "| data:", COMP_DIR, "| frozen:", FROZEN_DIR, "| work:", WORK)
+print(f"SETTINGS: POP_WEIGHT={POP_WEIGHT} | USE_TIER={USE_TIER} | TIER_LIB_BONUS={TIER_LIB_BONUS if USE_TIER else 'n/a'} | WINDOW_SCALE={WINDOW_SCALE} | CENTRE_ON_OFFSET={CENTRE_ON_OFFSET} | EXTRA_POOL_DIR={EXTRA_POOL_DIR!r}")
+if USE_TIER:
+    assert POP_WEIGHT > 0, "USE_TIER needs POP_WEIGHT > 0: without the prior, thousands of same-mass PubChem isomers swamp the library"
+    _need = ["pc_mass", "pc_off", "pc_smiles", "pc_ik14", "pc_lsid", "pc_lpmid"]
+    _root = os.environ.get("CASMI_TIER_DIR") or next((os.path.dirname(h) for h in glob.glob("/kaggle/input/**/pc_lsid.npy", recursive=True) + glob.glob("data/external/pubchem_tier/pc_lsid.npy")), None)
+    _missing = [n for n in _need if _root is None or not glob.glob(f"{_root}/**/{n}.npy", recursive=True)]
+    assert not _missing, f"PubChem tier arrays missing {_missing}: attach dmitriigluzdov/casmi26-pubchem-popularity-prior (searched {_root})"
+    print("PubChem tier found under", _root)
+assert os.path.exists(TEST_PATH), f"test.parquet not found under {COMP_DIR}"
+assert os.path.exists(os.path.join(FROZEN_DIR, "frozen_meta.json")), f"no frozen_meta.json in {FROZEN_DIR}: attach the dataset made from the training notebook's frozen/ folder"
+''')
+
+# =====================================================================================================================================
+code("load_frozen", r'''
+# ======================================== 2. LOAD THE FROZEN MODEL SETTINGS AND THE LIBRARY ========================================
+fd = FROZEN_DIR; META = json.load(open(f"{fd}/frozen_meta.json"))
+BIAS, HW = META["bias"], META["hw"]                                                        # per-adduct calibration offsets / half-widths (ppm)
+HW = {k: v * WINDOW_SCALE for k, v in HW.items()}
+if not CENTRE_ON_OFFSET: BIAS = {k: 0.0 for k in BIAS}
+if WINDOW_SCALE != 1.0 or not CENTRE_ON_OFFSET: print(f"mass windows changed: half-widths x{WINDOW_SCALE} -> {({k: round(v, 1) for k, v in HW.items()})}, centred on offset: {CENTRE_ON_OFFSET}")
+FEAT = Features.__new__(Features)                                                          # feature settings fitted on the training rows
+FEAT.top_inst, FEAT.cols, FEAT.ce_med = pd.Index(META["top_inst"]), pd.Index(META["cols"]), META["ce_med"]
+T_ = pd.read_parquet(f"{fd}/train_library.parquet"); fp_u8 = np.load(f"{fd}/train_library_fp.npy")
+assert len(T_) == len(fp_u8) == META["n_library"], "frozen library rows do not match its fingerprints"
+lib_smiles, lib_keys, mass = T_.smiles.tolist(), T_.key.tolist(), T_.mass.values
+tick(f"frozen: {META['n_in']:,} input columns, {len(T_):,} training molecules, DEBUG-run = {META['debug']}")
+lib_smiles, lib_keys, fp_u8, mass = merge_coconut(lib_smiles, lib_keys, fp_u8, mass)
+LIB = Library(lib_smiles, lib_keys, mass, unit(fp_u8.astype(np.float32)))
+if POP_WEIGHT > 0: attach_popularity(LIB, POP_WEIGHT)
+tick(f"library ready: {len(LIB.keys):,} molecules, mass {LIB.mass_sorted[0]:.1f}-{LIB.mass_sorted[-1]:.1f}")
+''')
+
+# =====================================================================================================================================
+code("infer_predict", r'''
+# ======================================== 4. PREDICT + SUBMIT ========================================
+keep = np.load(f"{FROZEN_DIR}/keep.npy")
+assert X_TEST.shape[1] == META["n_cols_full"], f"test features have {X_TEST.shape[1]} columns, the frozen model expects {META['n_cols_full']}"
+net = make_net(len(keep)).to(DEVICE); net.load_state_dict(torch.load(f"{FROZEN_DIR}/deep_best.pt", map_location=DEVICE))
+P_test_deep = predict_mlp(net, X_TEST[:, keep].tocsr())
+tick(f"predicted {len(P_test_deep):,} test spectra")
+if USE_TIER:
+    assert POP_WEIGHT > 0, "the PubChem channel needs the popularity prior (POP_WEIGHT > 0): without it thousands of same-mass isomers swamp the library"
+    TIER = Tier(find_tier_dir()); tick(f"PubChem tier: {len(TIER.mass):,} structures")
+    SUB_DEEP, RANKED_DEEP, _ = make_submission_tier(P_test_deep, "deep", TIER, POP_WEIGHT, lib_bonus=TIER_LIB_BONUS, workers=TIER_WORKERS)
+    publish(SUB_DEEP, f"frozen deep MLP + PubChem channel, library {len(LIB.keys):,}, popularity weight {POP_WEIGHT}, library bonus {TIER_LIB_BONUS}")
+else:
+    SUB_DEEP, RANKED_DEEP, _ = make_submission(P_test_deep, "deep")
+    publish(SUB_DEEP, f"frozen deep MLP, library {len(LIB.keys):,}, popularity weight {POP_WEIGHT}")
+print("\nexample rows:"); print(SUB_DEEP.assign(smiles=SUB_DEEP.smiles.str.split(";").str[:3].str.join(";")).head(5).to_string(index=False))
 tick("done")
 ''')
