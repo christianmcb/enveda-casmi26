@@ -20,8 +20,8 @@ VARIANTS = {
                  note="**This notebook trains only the deep residual MLP**, so that one notebook = one submission. The Ridge version is `casmi_submission_baseline.ipynb`."),
     "both": dict(RUN_BASELINE="True", RUN_DEEP="True", FINAL_CHOICE='"deep"', note=None),
 }
-INFER_ONLY = {"infer_title", "infer_config", "load_frozen", "infer_predict", "tier_defs"}                      # cells that exist only in the inference notebook
-INFER_ORDER = ["infer_title", "infer_config", "helpers_mass", "feature_defs", "mlp_defs", "pool_defs", "load_frozen", "test_features", "ranking", "tier_defs", "infer_predict"]
+INFER_ONLY = {"infer_title", "infer_config", "load_frozen", "infer_predict", "tier_defs", "fpnet_defs"}                      # cells that exist only in the inference notebook
+INFER_ORDER = ["infer_title", "infer_config", "helpers_mass", "feature_defs", "mlp_defs", "pool_defs", "load_frozen", "test_features", "ranking", "tier_defs", "fpnet_defs", "infer_predict"]
 os.makedirs("kaggle", exist_ok=True)
 for name, v in VARIANTS.items():
     nb = nbf.v4.new_notebook()

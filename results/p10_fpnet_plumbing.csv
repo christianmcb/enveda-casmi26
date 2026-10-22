@@ -1,0 +1,5 @@
+models,pop_weight,mrr25_leaked
+fpnet_full1,0.0,0.9426
+fpnet_full1,0.15,0.9243
+full1+A+B,0.0,0.9499
+full1+A+B,0.15,0.9424
