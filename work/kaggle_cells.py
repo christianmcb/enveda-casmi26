@@ -882,6 +882,10 @@ It does no training and no canonicalisation, so it runs in minutes, and it is th
 
 **Inputs to attach:** the competition data; the dataset made from the training notebook's `frozen/` folder; the COCONUT cache dataset; the
 popularity dataset (`dmitriigluzdov/casmi26-pubchem-popularity-prior`, only needed when `POP_WEIGHT > 0`). A GPU is not needed.
+For `USE_FPNET = True` also attach three public datasets by Ahmed Berat Özer: `ahmedberatozer/casmi26-fpnet-full1` (the model), `ahmedberatozer/casmi26-v3-models`
+(its code, `casmi/fpnet.py`, and with `FPNET_MODELS = "full1+AB"` the extra models `fpnet_0.pt`, `fpnet_1.pt`) and `ahmedberatozer/casmi26-v2-pool` (fingerprint bit list, candidate fingerprints `pool_fp.npy`, `pool_meta.parquet`).
+These carry the competition data terms (non-commercial, attribution): FPNet architecture, fingerprint bits and candidate pool by Ahmed Berat Özer
+(https://www.kaggle.com/ahmedberatozer); the training kit of the fold-safe variants by Dmitrii Gluzdov.
 """)
 
 # =====================================================================================================================================
@@ -905,8 +909,11 @@ POP_WEIGHT = 0.15            # popularity prior weight. score = z(cosine within 
 USE_TIER = False             # True = add the PubChem mass-window channel (P7d). Needs POP_WEIGHT > 0 and the popularity dataset (it holds the tier arrays).
 TIER_LIB_BONUS = 0.0         # only with USE_TIER: source prior added to every library (train + COCONUT) candidate, in z-score units. Higher = trust the library more.
 TIER_WORKERS = 4             # processes for fingerprinting / tautomer keys of the tier candidates (Kaggle gives 4 cores)
-WINDOW_SCALE = 1.0           # multiplies every per-adduct mass-window half-width (frozen: max(3 ppm, 3.5 sigma) fitted on enveda-180). 1.0 = as trained. >1 probes whether the hidden test needs wider windows.
+WINDOW_SCALE = 1.0           # multiplies every per-adduct mass-window half-width (frozen: max(3 ppm, 3.5 sigma) fitted on enveda-180). 1.0 = as trained (LB 0.146). 2.0 scored 0.148 (noise-level difference): windows are not a lever, keep 1.0.
 CENTRE_ON_OFFSET = True      # True: windows centred on the per-adduct instrument offset fitted on enveda-180 (+2.2 ppm for [M+H]+). False: centred on 0 (v0.1 style).
+USE_FPNET = False            # P10 option P: rank with the public pretrained FPNet (10,226-bit fingerprint model, Ozer / Gluzdov) instead of our MLP cosine. Needs the 3 FPNet datasets (see title cell).
+FPNET_MODELS = "full1"       # only with USE_FPNET: "full1" = fpnet_full1 alone (LB 0.229); "full1+AB" = mean of the logits of fpnet_full1 + fpnet_0 + fpnet_1 (casmi26-v3-models, "A+B").
+FPNET_W_OURS = 0.0           # only with USE_FPNET: weight of z(our MLP cosine) added to z(FPNet score) inside the mass window. 0.0 = FPNet only.
 EXTRA_POOL_DIR = "auto"      # COCONUT cache (coconut_v1.parquet + coconut_fp_v1.npy): "auto" = search /kaggle/input/** then ./artifacts. None = train-only library.
 # ##########################################################################################################################
 POP_PATH = "auto"            # pool_popularity.csv ("auto": search /kaggle/input/** then ./data/external/pop_prior)
@@ -915,6 +922,9 @@ if os.environ.get("CASMI_POP_WEIGHT"): POP_WEIGHT = float(os.environ["CASMI_POP_
 if os.environ.get("CASMI_USE_TIER"): USE_TIER = bool(int(os.environ["CASMI_USE_TIER"]))
 if os.environ.get("CASMI_WINDOW_SCALE"): WINDOW_SCALE = float(os.environ["CASMI_WINDOW_SCALE"])
 if os.environ.get("CASMI_TIER_LIB_BONUS"): TIER_LIB_BONUS = float(os.environ["CASMI_TIER_LIB_BONUS"])
+if os.environ.get("CASMI_USE_FPNET"): USE_FPNET = bool(int(os.environ["CASMI_USE_FPNET"]))
+if os.environ.get("CASMI_FPNET_MODELS"): FPNET_MODELS = os.environ["CASMI_FPNET_MODELS"]
+if os.environ.get("CASMI_FPNET_W_OURS"): FPNET_W_OURS = float(os.environ["CASMI_FPNET_W_OURS"])
 SEED = 42
 
 def find_comp_dir():
@@ -932,7 +942,9 @@ if FROZEN_DIR == "auto":
 import torch
 DEVICE = "cuda" if torch.cuda.is_available() else ("mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu")
 print("torch", torch.__version__, "| device:", DEVICE, "| DEBUG =", DEBUG, "| data:", COMP_DIR, "| frozen:", FROZEN_DIR, "| work:", WORK)
-print(f"SETTINGS: POP_WEIGHT={POP_WEIGHT} | USE_TIER={USE_TIER} | TIER_LIB_BONUS={TIER_LIB_BONUS if USE_TIER else 'n/a'} | WINDOW_SCALE={WINDOW_SCALE} | CENTRE_ON_OFFSET={CENTRE_ON_OFFSET} | EXTRA_POOL_DIR={EXTRA_POOL_DIR!r}")
+print(f"SETTINGS: POP_WEIGHT={POP_WEIGHT} | USE_TIER={USE_TIER} | TIER_LIB_BONUS={TIER_LIB_BONUS if USE_TIER else 'n/a'} | WINDOW_SCALE={WINDOW_SCALE} | CENTRE_ON_OFFSET={CENTRE_ON_OFFSET} | USE_FPNET={USE_FPNET} | FPNET_MODELS={FPNET_MODELS if USE_FPNET else 'n/a'} | FPNET_W_OURS={FPNET_W_OURS if USE_FPNET else 'n/a'} | EXTRA_POOL_DIR={EXTRA_POOL_DIR!r}")
+assert FPNET_MODELS in ("full1", "full1+AB"), FPNET_MODELS
+assert not (USE_FPNET and USE_TIER), "FPNet and the PubChem channel are not combined (one change at a time)"
 if USE_TIER:
     assert POP_WEIGHT > 0, "USE_TIER needs POP_WEIGHT > 0: without the prior, thousands of same-mass PubChem isomers swamp the library"
     _need = ["pc_mass", "pc_off", "pc_smiles", "pc_ik14", "pc_lsid", "pc_lpmid"]
@@ -965,6 +977,133 @@ tick(f"library ready: {len(LIB.keys):,} molecules, mass {LIB.mass_sorted[0]:.1f}
 ''')
 
 # =====================================================================================================================================
+code("fpnet_defs", r'''
+# ======================================== P10 / OPTION P: FPNET (public pretrained spectrum -> fingerprint model) ========================================
+# WHY: our MLP predicts a 1,024-bit Morgan fingerprint and was validated on molecules with close analogues in train; public pipelines that rank the SAME
+# candidate pool (train + COCONUT) with FPNet reach leaderboard 0.35+ against our 0.146. FPNet (Ahmed Berat Ozer, trained here on all competition spectra:
+# `fpnet_full1`) predicts logits z for 10,226 fingerprint bits (ECFP4/6, FCFP4, RDK6, ...); a candidate with fingerprint f scores f.z (Bayes log-likelihood
+# up to a constant). Query protocol copied from the public engine (casmi/engine.py): z = 0.5 * ( mean over the molecule's spectra of single-spectrum logits
+# + mean over polarities of the merged-spectrum logits ). Candidate fingerprints are precomputed for the 710,701-structure pool (casmi26-v2-pool) and
+# joined to our library on the metric key (99.5% of COCONUT keys and ~100% of training keys are present); library rows missing from the pool get the
+# window minimum. Final score inside the mass window: z(f.z) + FPNET_W_OURS * z(our cosine) + POP_WEIGHT * pop.
+import sys
+
+def _first(patterns):
+    for p_ in patterns:
+        hits = sorted(glob.glob(p_, recursive=True))
+        if hits: return hits[0]
+
+def find_fpnet_assets():
+    root = os.environ.get("CASMI_FPNET_DIR", "data/external/fpnet")
+    a = dict(code=_first(["/kaggle/input/**/casmi/fpnet.py", f"{root}/**/casmi/fpnet.py"]),
+             ckpt=_first(["/kaggle/input/**/fpnet_full1.pt", f"{root}/**/fpnet_full1.pt"]),
+             ckpt_a=_first(["/kaggle/input/**/fpnet_0.pt", f"{root}/**/fpnet_0.pt"]) if FPNET_MODELS == "full1+AB" else "",
+             ckpt_b=_first(["/kaggle/input/**/fpnet_1.pt", f"{root}/**/fpnet_1.pt"]) if FPNET_MODELS == "full1+AB" else "",
+             fp=_first(["/kaggle/input/**/pool_fp.npy", f"{root}/**/pool_fp.npy"]),
+             meta=_first(["/kaggle/input/**/pool_meta.parquet", f"{root}/**/pool_meta.parquet"]))
+    missing = [k for k, v in a.items() if v is None]
+    assert not missing, f"FPNet assets not found: {missing}. Attach ahmedberatozer/casmi26-fpnet-full1 (ckpt), casmi26-v3-models (code), casmi26-v2-pool (fp, meta)."
+    a["bits"] = os.path.join(os.path.dirname(a["fp"]), "fp_bits.npy")
+    assert os.path.exists(a["bits"]), "fp_bits.npy must sit next to pool_fp.npy (casmi26-v2-pool)"
+    return a
+
+class FPNetScorer:
+    def __init__(self, lib_keys, device):
+        A = find_fpnet_assets(); self.assets = A
+        sys.path.insert(0, os.path.dirname(os.path.dirname(A["code"])))                # parent folder of the `casmi` package
+        from casmi import fpnet, chem
+        from casmi.spectra import merge_spectra
+        self.fpnet, self.chem, self.merge_spectra = fpnet, chem, merge_spectra
+        paths = [A["ckpt"]] + ([A["ckpt_a"], A["ckpt_b"]] if FPNET_MODELS == "full1+AB" else [])          # ModelBank averages the logits of its models
+        self.bank = fpnet.ModelBank(paths, device=device)
+        self.nbits = int(len(np.load(A["bits"]))); assert self.bank.nbits == self.nbits, (self.bank.nbits, self.nbits)
+        self.packed = np.load(A["fp"], mmap_mode="r")                                    # (pool, ceil(nbits / 8)) uint8, bits packed
+        meta = pd.read_parquet(A["meta"], columns=["key"])
+        assert self.packed.shape == (len(meta), (self.nbits + 7) // 8), (self.packed.shape, len(meta))
+        s_ = pd.Series(np.arange(len(meta)), index=meta.key.values); s_ = s_[~s_.index.duplicated()]
+        self.pid = s_.reindex(lib_keys).fillna(-1).astype(np.int64).values                # library row -> pool row (-1 = not in the FPNet pool)
+        tick(f"FPNet ready ({'+'.join(os.path.basename(p_) for p_ in paths)}, {self.nbits} bits, device {device}); {np.mean(self.pid >= 0):.2%} of the {len(lib_keys):,} library rows have pool fingerprints")
+
+    def molecule_logits(self, test):
+        """{molecule_id: logits (nbits,)} following casmi/engine.py (single-spectrum view + merged-per-polarity view, averaged)."""
+        fpnet, chem = self.fpnet, self.chem
+        items_s, own_s, items_m, own_m, mids = [], [], [], [], []
+        for mid, g in test.groupby("molecule_id", sort=False):
+            mi = len(mids); mids.append(mid); spectra = []
+            for r in g.itertuples(index=False):
+                ce = np.atleast_1d(np.asarray(r.collision_energy_ev, float)); ce = ce[~np.isnan(ce)]
+                spectra.append(dict(mz=np.asarray(r.ms2_mzs, float), it=np.asarray(r.ms2_normalized_intensities, float), mode=1.0 if r.ionization_mode == "positive" else -1.0,
+                                    adduct=r.adduct, prec=float(r.precursor_mz), ce=float(ce.mean()) if len(ce) else None, ce_n=max(1, len(ce))))
+            for s_ in spectra:
+                pm, pi = fpnet.prep_peaks(s_["mz"], s_["it"], s_["prec"]); ok = s_["ce"] is not None
+                items_s.append(dict(mz=pm, it=pi, prec=s_["prec"], adduct_ix=chem.adduct_index(s_["adduct"]), ce=s_["ce"] if ok else 0.0, ce_known=1.0 if ok else 0.0,
+                                    n_merged=min(s_["ce_n"], 8), mode=s_["mode"])); own_s.append(mi)
+            for md in (1.0, -1.0):
+                grp = [s_ for s_ in spectra if s_["mode"] == md]
+                if not grp: continue
+                mm, ii = self.merge_spectra([(s_["mz"], s_["it"]) for s_ in grp]); prec = float(np.median([s_["prec"] for s_ in grp]))
+                pm, pi = fpnet.prep_peaks(mm, ii, prec); ces = [s_["ce"] for s_ in grp if s_["ce"] is not None]
+                ads = [s_["adduct"] for s_ in grp]; ad = max(set(ads), key=ads.count)
+                items_m.append(dict(mz=pm, it=pi, prec=prec, adduct_ix=chem.adduct_index(ad), ce=float(np.mean(ces)) if ces else 0.0, ce_known=1.0 if ces else 0.0,
+                                    n_merged=min(sum(s_["ce_n"] for s_ in grp), 8), mode=md)); own_m.append(mi)
+        tick(f"FPNet queries: {len(items_s):,} single-spectrum + {len(items_m):,} merged-polarity views for {len(mids):,} molecules")
+        zs, zm = self.bank.logits(items_s), self.bank.logits(items_m)
+        own_s, own_m = np.asarray(own_s), np.asarray(own_m)
+        Z = {mid: 0.5 * (zs[own_s == i].mean(0) + zm[own_m == i].mean(0)) for i, mid in enumerate(mids)}
+        tick("FPNet logits done"); return Z
+
+    def score(self, rows, z, chunk=4096):
+        """Raw f.z for library rows `rows`; rows without pool fingerprints get the minimum of the others."""
+        pid = self.pid[rows]; ok = pid >= 0; fz = np.zeros(len(rows), np.float32)
+        okidx = np.flatnonzero(ok)
+        for a in range(0, len(okidx), chunk):
+            sel = okidx[a:a + chunk]
+            fz[sel] = np.unpackbits(self.packed[pid[sel]], axis=1)[:, :self.nbits].astype(np.float32) @ z
+        if ok.any(): fz[~ok] = fz[ok].min()
+        return fz, int((~ok).sum())
+
+def window_rows(lo, hi, lib, k=25):
+    """Same window logic as rank_queries: library rows with mass in [lo, hi]; empty -> widen (10..250 ppm), finally the k nearest masses."""
+    a, b = np.searchsorted(lib.mass_sorted, [lo, hi]); idx = lib.order[a:b]
+    if len(idx) == 0:
+        c = 0.5 * (lo + hi)
+        for ppm in (10, 25, 50, 100, 250):
+            a, b = np.searchsorted(lib.mass_sorted, [c * (1 - ppm * 1e-6), c * (1 + ppm * 1e-6)])
+            if b > a: idx = lib.order[a:b]; break
+        if len(idx) == 0: idx = lib.order[np.argsort(np.abs(lib.mass_sorted - c))[:k]]
+    return idx
+
+def _zs(x): return (x - x.mean()) / (x.std() + 1e-6)
+
+def rank_queries_fpnet(keys, Pm, L, H, lib, scorer, Z, w_ours, k=25):
+    out, ncand, n_nofp = [], np.zeros(len(keys), int), 0
+    for i, mid in enumerate(keys):
+        idx = window_rows(L[i], H[i], lib, k); ncand[i] = len(idx)
+        fz, miss = scorer.score(idx, Z[mid]); n_nofp += miss
+        s = fz
+        if len(idx) > 1:
+            s = _zs(fz)
+            if w_ours: s = s + w_ours * _zs(lib.fp_unit[idx] @ Pm[i])
+            if lib.pop is not None: s = s + lib.pop_w * lib.pop[idx]
+        order = np.argpartition(-s, k)[:k] if len(idx) > k else np.arange(len(idx))
+        out.append(idx[order[np.argsort(-s[order])]])
+    return out, ncand, n_nofp
+
+def make_submission_fpnet(P_test, scorer, w_ours, name="fpnet"):
+    keys, Pm, L, H, nbad = pool_molecules(P_test, test.molecule_id.values, test_lo, test_hi)       # our MLP only supplies the windows and the optional fused term
+    Z = scorer.molecule_logits(test)
+    ranked, ncand, n_nofp = rank_queries_fpnet(keys, Pm, L, H, LIB, scorer, Z, w_ours)
+    sub = pd.DataFrame({"molecule_id": keys, "smiles": [";".join(LIB.smiles[j] for j in r) for r in ranked]})
+    sub = sub.set_index("molecule_id").loc[sample.molecule_id].reset_index()
+    n = validate_submission(sub, sample.molecule_id)
+    ours, _ = rank_queries(Pm, L, H, LIB)                                                           # diagnostics only: how different is FPNet's list from ours?
+    top1 = np.mean([a[0] == b[0] for a, b in zip(ranked, ours)]); top25 = np.mean([len(set(a) & set(b)) / max(1, len(a)) for a, b in zip(ranked, ours)])
+    tick(f"{name}: {len(sub)} molecules | guesses per molecule: median {n.median():.0f}, min {n.min()} | candidates in window: median {np.median(ncand):.0f}, max {ncand.max()} | "
+         f"window rows without FPNet fingerprint {n_nofp:,} | top-1 agrees with our MLP list {top1:.1%}, top-25 overlap {top25:.1%} | non-overlapping spectra windows {nbad}")
+    return sub, ranked, Z
+''')
+
+# =====================================================================================================================================
 code("infer_predict", r'''
 # ======================================== 4. PREDICT + SUBMIT ========================================
 keep = np.load(f"{FROZEN_DIR}/keep.npy")
@@ -972,7 +1111,11 @@ assert X_TEST.shape[1] == META["n_cols_full"], f"test features have {X_TEST.shap
 net = make_net(len(keep)).to(DEVICE); net.load_state_dict(torch.load(f"{FROZEN_DIR}/deep_best.pt", map_location=DEVICE))
 P_test_deep = predict_mlp(net, X_TEST[:, keep].tocsr())
 tick(f"predicted {len(P_test_deep):,} test spectra")
-if USE_TIER:
+if USE_FPNET:
+    FPS = FPNetScorer(LIB.keys, "cuda" if torch.cuda.is_available() else "cpu")
+    SUB_DEEP, RANKED_DEEP, _ = make_submission_fpnet(P_test_deep, FPS, FPNET_W_OURS)
+    publish(SUB_DEEP, f"public FPNet ({FPNET_MODELS}) on library {len(LIB.keys):,}, w_ours {FPNET_W_OURS}, popularity weight {POP_WEIGHT}")
+elif USE_TIER:
     assert POP_WEIGHT > 0, "the PubChem channel needs the popularity prior (POP_WEIGHT > 0): without it thousands of same-mass isomers swamp the library"
     TIER = Tier(find_tier_dir()); tick(f"PubChem tier: {len(TIER.mass):,} structures")
     SUB_DEEP, RANKED_DEEP, _ = make_submission_tier(P_test_deep, "deep", TIER, POP_WEIGHT, lib_bonus=TIER_LIB_BONUS, workers=TIER_WORKERS)
