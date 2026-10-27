@@ -1,0 +1,9 @@
+id,submission,score,note
+1,"train-only library, deep MLP cosine",0.076,submitted 2026-10-21
+2,"+ COCONUT (684,568 candidates)",0.128,2026-10-21
+3,+ popularity prior w=0.15,0.146,2026-10-21
+4,prior w=0.30,0.14,2026-10-21
+5,w=0.30 + PubChem mass-window channel,0.142,2026-10-21
+6,"windows x2 (WINDOW_SCALE=2.0), w=0.15",0.148,2026-10-22
+7,"public FPNet fpnet_full1 (FPNet only), w=0.15",0.229,2026-10-22
+8,FPNet ensemble full1+A+B (3 checkpoints),,"2026-10-22, scoring queue pending"

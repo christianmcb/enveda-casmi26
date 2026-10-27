@@ -1,14 +1,14 @@
 # Enveda CASMI 2026 — Molecule ID from MS/MS spectra
 
-**Release v0.2** · Kaggle competition *Enveda CASMI 2026 – Molecule ID From Mass Spectra* · metric **MRR@25**
+**Release v0.3** · Kaggle competition *Enveda CASMI 2026 – Molecule ID From Mass Spectra* · metric **MRR@25**
 
-Given an LC-MS/MS spectrum of a natural product, predict its 2D structure (SMILES), including molecules that never appear in the training data. v0.2 is an end-to-end, leakage-aware solution: spectrum → fingerprint deep MLP → mass-window candidate filter → ranking over a train + COCONUT library with a PubChem popularity prior. **Best hidden-test score so far: MRR@25 = 0.146.**
+Given an LC-MS/MS spectrum of a natural product, predict its 2D structure (SMILES), including molecules that never appear in the training data. v0.2 was an end-to-end, leakage-aware solution: spectrum → fingerprint deep MLP → mass-window candidate filter → ranking over a train + COCONUT library with a PubChem popularity prior (0.146). **v0.3 swaps the ranking model for the public pretrained FPNet and reaches MRR@25 = 0.229 on the hidden test (best so far).**
 
-> **Read this first (honest status).** Leaderboard history: **0.076** (train-only library) → **0.128** (+ COCONUT) → **0.146** (+ popularity prior); a PubChem mass-window channel was neutral (0.142 vs 0.140 at the same weight). A single score has a standard error of about 0.014, so differences below ~0.01 are noise. Public pipelines reach ~0.45 and score ~0.35 on an essentially identical candidate pool, so **the ranker, not the pool, is now the gap**. The local benchmark numbers below measure ranking quality when the true molecule is in the candidate pool; they are optimistic for novel molecules (see [Limitations](#limitations)).
+> **Read this first (honest status).** Leaderboard history: **0.076** (train-only library) → **0.128** (+ COCONUT) → **0.146** (+ popularity prior) → 0.148 (mass windows ×2, a calibration probe: no effect) → **0.229** (public FPNet replaces our MLP as the ranker). A PubChem mass-window channel was neutral (0.142 vs 0.140 at the same weight). A single score has a standard error of about 0.014, so differences below ~0.01 are noise; the +0.081 of FPNet is about six standard errors. Public pipelines reach 0.35–0.46 on essentially the same candidate pool, so a gap of 0.12–0.23 remains and **the ranker/engine is still the lever**. A further submission (average of three FPNet checkpoints) was still in Kaggle's scoring queue when this release was written; it is not in the tables. The local benchmark numbers in the v0.1–v0.3b sections measure ranking quality of *our own* MLP when the true molecule is in the candidate pool; they are optimistic for novel molecules, and **FPNet cannot be validated locally** (it was trained on every molecule we could validate on); see [Limitations](#limitations).
 >
-> **The walkthrough with every figure and table is the report notebook [`notebooks/casmi_v0_2.ipynb`](notebooks/casmi_v0_2.ipynb)** (already executed; needs no competition data).
+> **The walkthroughs with every figure and table are the report notebooks [`notebooks/casmi_v0_3.ipynb`](notebooks/casmi_v0_3.ipynb) (this release: windows probe and FPNet) and [`notebooks/casmi_v0_2.ipynb`](notebooks/casmi_v0_2.ipynb) (data, method, experiments up to 0.146)** (already executed; neither needs competition data).
 
-![Leaderboard history](reports/v02_1_leaderboard_history.png)
+![Leaderboard history](reports/v03_1_leaderboard_history.png)
 
 ---
 
@@ -43,7 +43,8 @@ precursor m/z + adduct ──► neutral mass ──► mass window ──► ca
 3. **Features** (v0.1: 1 Da bins; final: fragment block + neutral-loss block, each in nominal-mass × mass-defect sub-bins, ~32k sparse columns).
 4. **Targets:** Morgan fingerprint, radius 2, 1,024 bits. **Model:** Ridge (v0.1) → deep residual MLP (v0.3b, 633k training spectra).
 5. **Candidates:** a library of 684,568 molecules (252,418 training molecules + 432,150 COCONUT natural products, v0.4) filtered to those whose exact mass falls in the per-adduct, instrument-offset-corrected window (centred, half-width max(3 ppm, 3.5σ)).
-6. **Ranking:** `z(cosine(predicted, candidate fingerprint) within the window) + 0.15 · pop`, where `pop = ln(1+substance records) + ln(1+PubMed articles)` is a public PubChem documentation prior (v0.4b). For a test molecule with several spectra, the predicted fingerprints are averaged and the mass windows intersected (**molecule-level pooling**, +0.03 to +0.06 MRR).
+6. **Ranking (v0.2):** `z(cosine(predicted, candidate fingerprint) within the window) + 0.15 · pop`, where `pop = ln(1+substance records) + ln(1+PubMed articles)` is a public PubChem documentation prior (v0.4b). For a test molecule with several spectra, the predicted fingerprints are averaged and the mass windows intersected (**molecule-level pooling**, +0.03 to +0.06 MRR).
+7. **Ranking (v0.3, best):** the same library, windows, pooling and prior, but the spectrum → fingerprint model is the public **FPNet** (transformer, 10,226-bit fingerprint, trained for ranking) and a candidate scores `f · logits` with precomputed candidate fingerprints; our MLP is only used for the windows (and an optional blend, off). See [v0.3](#v03--replace-the-ranker-with-a-public-pretrained-model-p10).
 
 **Validation that avoids the usual traps.** 80/20 split grouped by Murcko scaffold computed with stereo removed; every acyclic molecule is its own group; any validation molecule whose canonical key is in train is hard-removed and the overlap is `assert`ed to be zero. Tautomer canonicalisation is cached. Seeds are fixed (42). Scores are reported on two slices: the **enveda-180 validation slice** (test-like acquisition and mass window; the primary slice) and the **mixed validation set** (2,000 spectra from all sources), both against a **230k-molecule candidate pool** (true molecules + 200k decoys) because a 30k pool badly flatters the score.
 
@@ -74,6 +75,9 @@ Each row changes one thing; the full record with confidence intervals, checks an
 | **v0.4b + popularity prior (w = 0.15)** | same | z(cosine) + 0.15·pop | **0.146** |
 | prior weight 0.30 | same | z(cosine) + 0.30·pop | 0.140 |
 | v0.4c + PubChem mass-window channel (library bonus 2, w = 0.30) | + PubChem structures in each window | z(cosine) + 0.30·pop (+ bonus) | 0.142 |
+| v0.5a mass windows ×2 (calibration probe), w = 0.15 | same | z(cosine) + 0.15·pop | 0.148 |
+| **v0.5b public FPNet (`fpnet_full1`) replaces our MLP, w = 0.15** | same | z(f·logits) + 0.15·pop | **0.229** |
+| v0.5c average of three FPNet checkpoints | same | same | *pending (scoring queue)* |
 
 An early Ridge baseline notebook run on a tiny sample scored 0.0 (uninformative).
 
@@ -203,14 +207,37 @@ Three explanations fit and were not separated: the benchmark is optimistic (know
 
 **Tooling.** Training takes ~2 h on a Kaggle GPU, so the trained model, the training part of the library and the feature settings are *frozen* into a dataset and an inference-only notebook (`kaggle/casmi_infer.ipynb`, minutes, no GPU) runs the pool and ranking experiments. See [`kaggle/README.md`](kaggle/README.md).
 
+### v0.3 — Replace the ranker with a public pretrained model (P10)
+Full walkthrough with figures: [`notebooks/casmi_v0_3.ipynb`](notebooks/casmi_v0_3.ipynb). Log entries: [`docs/EXPERIMENT_LOG.md`](docs/EXPERIMENT_LOG.md) ("P10 ...").
+
+**Probe: are the mass windows too tight? (no).** Every query keeps only library molecules in a window around the precursor-derived neutral mass, calibrated on training spectra of the lab behind the test data. Our benchmark can only measure inside the window, so a different calibration of the hidden batch would silently zero some molecules. Doubling every half-width (`WINDOW_SCALE = 2.0`) moved the score **0.146 → 0.148**, inside the noise: windows are not a lever (default stays ×1).
+
+![Window probe](reports/v03_2_window_probe.png)
+
+**FPNet as the ranker (+0.081).** The diagnosis of v0.2 was that the ranking model, not the pool, was the gap. [FPNet](https://www.kaggle.com/ahmedberatozer) (Ahmed Berat Özer) is a transformer over the peaks that outputs logits for 10,226 fingerprint bits (ECFP4/ECFP6/FCFP4, RDKit paths, atom pairs, torsions, MACCS) and is trained on the ranking task itself with hard negatives of the same mass; a candidate with fingerprint **f** scores **f · logits**. Candidate fingerprints are precomputed for the 710,701-structure public pool and joined to our library on the metric key (training keys 235,853 of 235,854, COCONUT 430,287 of 432,648). Only the scoring step changed (library 684,568, windows ×1, molecule-level pooling, prior 0.15 all as before): **0.146 → 0.229**.
+
+![FPNet pipeline](reports/v03_3_fpnet_pipeline.png)
+
+One query per molecule follows the public engine's recipe: the mean of the logits of its single spectra and the mean of the logits of its per-polarity merged spectra, averaged. Implementation: cell `fpnet_defs` of [`work/kaggle_cells.py`](work/kaggle_cells.py), switched by `USE_FPNET` / `FPNET_MODELS` / `FPNET_W_OURS` in the settings block of `kaggle/casmi_infer.ipynb`.
+
+**Checks (wiring only).** There is no honest local score for FPNet. [`work/test_fpnet_plumbing.py`](work/test_fpnet_plumbing.py) recovers the true structure of the 400 visible-test molecules from their twins in the training file (the visible test is a sample of train) and ranks them with the notebook's own code: MRR@25 0.92–0.95, median window 54 candidates, no library row without a fingerprint. This is **leaked by construction** and only shows that queries, bit layout, key join and ranking are wired correctly.
+
+![FPNet assets and checks](reports/v03_4_fpnet_assets_and_checks.png)
+
+Tables: [`results/p10_leaderboard.csv`](results/p10_leaderboard.csv), [`p10_window_policy.csv`](results/p10_window_policy.csv), [`p10_fpnet_bit_blocks.csv`](results/p10_fpnet_bit_blocks.csv), [`p10_fpnet_pool_coverage.csv`](results/p10_fpnet_pool_coverage.csv), [`p10_fpnet_plumbing.csv`](results/p10_fpnet_plumbing.csv).
+
+**Pending: three-checkpoint ensemble.** `FPNET_MODELS = "full1+AB"` averages the logits of `fpnet_full1` and the public `fpnet_0`, `fpnet_1` (same architecture and bit layout). Expectation written before the result: +0.00 to +0.03 (swapping one checkpoint for another changed the public notebooks' own score by only 0.002). The result was not available when this release was written.
+
 ---
 
 ## Limitations
 - **Candidate pool.** Only an estimated ~25–33% of hidden molecules are reachable at all (≈12–14% in the training set, ≈12–19% COCONUT-only); the rest score 0 whatever the ranker does. These shares are inferred from leaderboard differences and assumed molecule-level MRRs, not measured.
-- **Ranker.** Spectrum → fingerprint MLP with cosine ranking. No forward models (spectrum simulation for candidates), no analog propagation from similar training spectra, no trained re-ranker; public pipelines on a comparable pool score ~0.35, so this is the main gap.
+- **Ranker.** v0.3 ranks with the public FPNet (0.229). Still missing relative to the public pipelines that reach 0.35–0.46: analog propagation from similar training spectra, fragmentation/sub-formula explanations of peaks, derivative generation, a trained LightGBM re-ranker, forward models (spectrum simulation for candidates). This is still the main gap.
+- **FPNet cannot be validated locally.** `fpnet_full1` was trained on all training folds, i.e. on every molecule our validation uses; only the leaderboard (one score, standard error ≈ 0.014) measures it. The gain mixes FPNet's better fingerprint, its ranking-aware training and the interaction with the popularity weight (0.15, chosen when ranking with our MLP and not retuned). The three-checkpoint ensemble result is pending.
+- **Public weights, non-commercial terms.** The FPNet checkpoint, code and pool carry the competition-data terms (non-commercial, attribution); none of them is redistributed here.
 - **Score noise.** About 400 hidden molecules and an MRR of ~0.14 give a standard error of ≈0.014 per score. The prior weight (0.15 vs 0.30) and the PubChem channel (+0.002) are not distinguishable from noise.
 - **Domain gap.** Local validation is dominated by lab-library chemistry. At tier D every enveda-180 validation molecule has a training neighbour at Tanimoto ≥ 0.4; for genuinely novel molecules (< 0.3) the deep model's gain is unconfirmed (n = 97, CI includes 0). The PubChem benchmark is similarly optimistic (known, well-documented truths), which is the most likely reason it over-predicted.
-- **Mass-window calibration** (offsets and widths) was fitted on enveda-180 training spectra; whether the hidden test shares it is untested. Features stop at m/z 1,000 (hidden masses reach ~1,159 Da).
+- **Mass-window calibration** (offsets and widths) was fitted on enveda-180 training spectra; doubling the windows changed the hidden-test score by +0.002 (noise), so the calibration transfers well enough. Features stop at m/z 1,000 (hidden masses reach ~1,159 Da).
 - **The benchmark pool's decoys** are mostly training molecules at tier D (no leak of the validation truth, but unlike the test situation); the real library (684k) has more distractors than the 230k benchmark pool.
 - **One seed per run**; CIs cover validation-query sampling, not training randomness. MLP hyper-parameters were tuned at tier A and early-stopped on BCE, not on ranking; training uses ≤ 3 spectra per molecule (633k of 1.73M cleaned spectra).
 - **The visible `test.parquet` is a placeholder** drawn from training spectra (all 1,213 spectra have exact twins in train); Kaggle commit-run scores on it are meaningless, only the hidden-test rerun counts.
@@ -220,17 +247,18 @@ Three explanations fit and were not separated: the benchmark is optimistic (know
 ```
 README.md
 requirements.txt
-notebooks/casmi_v0_2.ipynb                v0.2 REPORT notebook: data exploration, method, all experiments, leaderboard, limitations (executed, no data needed)
+notebooks/casmi_v0_3.ipynb                v0.3 REPORT notebook: windows probe, FPNet as the ranker, checks, limitations (executed, no data needed)
+notebooks/casmi_v0_2.ipynb                v0.2 REPORT notebook: data exploration, method, all experiments up to 0.146 (executed, no data needed)
 notebooks/enveda-casmi26-baseline.ipynb   v0.1 baseline + EDA/P3/P4/P5 cells (outputs kept for the v0.1 part)
-reports/                                  figures (p2_* EDA, p3_* mass window, p4*/p5* models, v01_* baseline, v02_* pool and PubChem channel)
+reports/                                  figures (p2_* EDA, p3_* mass window, p4*/p5* models, v01_* baseline, v02_* pool and PubChem channel, v03_* windows probe and FPNet)
 results/                                  per-experiment tables (scores, bootstrap CIs, novelty/source breakdowns, training histories, PubChem benchmark)
 docs/EXPERIMENT_LOG.md                    one entry per version: hypothesis, single change, numbers, caveats, decision
 src/                                      reusable modules: pipeline, benchmark, mass window, MLP, cache builders
-work/                                     experiment scripts (p3_ … p7d_), Kaggle-notebook source and builder, release-notebook builder
+work/                                     experiment scripts (p3_ … p7d_), Kaggle-notebook source and builder, FPNet wiring test (test_fpnet_plumbing.py), release-notebook builders
 kaggle/                                   Kaggle notebooks: training (+freeze), Ridge baseline, inference-only (casmi_infer), run instructions
 reference/v0_1_pipeline.py                condensed v0.1 code (reference only, not directly runnable)
 ```
-The Kaggle notebooks are generated from `work/kaggle_cells.py`; edit that, then run `python work/build_kaggle_notebook.py`. The report notebook is generated by `python work/release_eda.py && python work/build_release_notebook.py` (needs the local `artifacts/`, which are not committed; the notebook embeds the tables it plots).
+The Kaggle notebooks are generated from `work/kaggle_cells.py`; edit that, then run `python work/build_kaggle_notebook.py`. The report notebooks are generated by `python work/release_eda.py && python work/build_release_notebook.py` (v0.2) and `python work/build_release_notebook_v03.py` (v0.3; embeds the tables `results/p10_*.csv`, which the 2026-10-22 session wrote into `artifacts/`).
 
 ## Reproducing
 Data is not included. Download the competition files from the Kaggle page into `data/` (`train.parquet`, `test.parquet`, `sample_submission.csv`).
@@ -247,20 +275,20 @@ python work/p7a_pool_cost.py               # cost of the larger (COCONUT) pool
 python src/build_coconut_cache.py          # COCONUT keys/masses/fingerprints (needs the public COCONUT Kaggle dataset in data/external/coconut/)
 python work/p7d_tier_benchmark.py          # PubChem-channel benchmark (needs the PubChem tier arrays, ~9 GB, in data/external/pubchem_tier/)
 ```
-Notes: `src/v1_pipeline.py` still loads the v0.1 decoy files (`dec_keys.npy`, `dec_fp_n.npy`, `dec_mass.npy`) from the working directory; they are produced by the v0.1 notebook (they are not included here, 830 MB). The Ridge solver builds a ~6–8 GB Gram matrix and a 16 GB machine cannot run it alongside GPU training; scripts expect the layout above (`data/`, `artifacts/`). To submit, follow [`kaggle/README.md`](kaggle/README.md): train once (or restore the cached features), freeze the model and the training part of the library, then run `kaggle/casmi_infer.ipynb` with its settings block (`POP_WEIGHT`, `USE_TIER`, `TIER_LIB_BONUS`, `WINDOW_SCALE`). Internet is disabled in the competition notebooks, so COCONUT, the popularity prior and the frozen model are attached as Kaggle datasets.
+Notes: `src/v1_pipeline.py` still loads the v0.1 decoy files (`dec_keys.npy`, `dec_fp_n.npy`, `dec_mass.npy`) from the working directory; they are produced by the v0.1 notebook (they are not included here, 830 MB). The Ridge solver builds a ~6–8 GB Gram matrix and a 16 GB machine cannot run it alongside GPU training; scripts expect the layout above (`data/`, `artifacts/`). For the FPNet ranker (v0.3) additionally attach the public Kaggle datasets `ahmedberatozer/casmi26-fpnet-full1`, `ahmedberatozer/casmi26-v3-models` (code and the extra checkpoints) and `ahmedberatozer/casmi26-v2-pool` (candidate fingerprints, bit list) to `kaggle/casmi_infer.ipynb` and set `USE_FPNET = True`; locally `python work/test_fpnet_plumbing.py` runs the leaked wiring check after downloading them into `data/external/fpnet/` (layout in the script header and `kaggle/README.md`). To submit, follow [`kaggle/README.md`](kaggle/README.md): train once (or restore the cached features), freeze the model and the training part of the library, then run `kaggle/casmi_infer.ipynb` with its settings block (`POP_WEIGHT`, `USE_TIER`, `TIER_LIB_BONUS`, `WINDOW_SCALE`, `USE_FPNET`, `FPNET_MODELS`, `FPNET_W_OURS`). Internet is disabled in the competition notebooks, so COCONUT, the popularity prior and the frozen model are attached as Kaggle datasets.
 
 ## Data, rules and licences
 - Competition data is not redistributed here. Figures and tables are derived from it; the competition data are reported to be CC BY-NC 4.0, so keep the project non-commercial and credit the sources.
 - The COCONUT candidate cache is built from the Kaggle dataset `prvsiyan/coconut-casmi26-candidates` (CC BY-NC-SA 4.0); credit the author if you use it.
 - The popularity prior and the PubChem tier come from `dmitriigluzdov/casmi26-pubchem-popularity-prior` (PubChem data, courtesy of the U.S. National Library of Medicine; LOTUS counts CC BY 4.0; NPAtlas CC BY-NC 4.0; see that dataset's README). Comparisons with public pipelines are quoted from the public notebook *CASMI 26: The Data Behind Spectra to Structures* and the notebooks credited there.
+- **FPNet (v0.3):** architecture, fingerprint bit selection, candidate pool and checkpoints by Ahmed Berat Özer (`ahmedberatozer/casmi26-fpnet-full1`, `casmi26-v3-models`, `casmi26-v2-pool`); fold-safe training kit and audit by Dmitrii Gluzdov (`dmitriigluzdov/casmi26-fold-safe-fpnet`). They are public Kaggle datasets under the competition data terms (non-commercial, attribution). This repository contains only code that loads them; it does not redistribute weights, fingerprints or competition data.
 - The frozen model and run-cache datasets contain competition-derived data and should stay private.
 - **Check the competition rules on code sharing before making this repository public while the competition is running** (final submission 2026-12-14). Rules wording on external data and notebook requirements was confirmed (public external data and pretrained models are allowed; submissions only via offline Notebooks, ≤ 9 h), but the code-sharing clause has not been read from the Rules page by the author.
 - No software licence has been chosen yet.
 
 ## Roadmap
-1. **Close the ranker gap**: analog propagation from similar training spectra and/or public pretrained fingerprint networks and forward models (candidate-side spectrum simulation), fused with the MLP cosine; judge on a similarity-controlled validation slice and on the leaderboard.
-2. **Check the mass-window calibration on the hidden test** (`WINDOW_SCALE` probe in `kaggle/casmi_infer.ipynb`).
-3. Similarity-controlled validation (held-out molecule clusters at Tanimoto < 0.4) and a natural-product hold-out before trusting absolute numbers.
-4. Re-tune the deep MLP at scale (MRR-aligned early stopping, multiple seeds, all 1.73M spectra).
+1. **Read the pending three-checkpoint result**, then decide between more FPNet variants (fold-safe checkpoints; a small blend with our MLP) and the bigger step below.
+2. **Close the rest of the ranker gap (0.229 vs 0.35–0.46):** feasibility study of running the public engine (analog propagation, fragmentation and sub-formula channels, trained LightGBM ranker, optional derivative generation): inputs, runtime, licence; then build it as one change in `kaggle/casmi_infer.ipynb`.
+3. Similarity-controlled validation (held-out molecule clusters at Tanimoto < 0.4) and the fold-safe FPNet checkpoints as a way to measure behaviour on unseen molecules before trusting absolute numbers.
+4. Re-tune the deep MLP at scale (MRR-aligned early stopping, multiple seeds, all 1.73M spectra) only if our MLP stays in the final blend.
 5. Revisit the PubChem channel only with a stronger ranker (it was neutral with fingerprint cosine).
-
